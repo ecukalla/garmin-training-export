@@ -1,0 +1,16 @@
+# Personal health/training data the exporter generates — never committed
+data/
+
+# Private files kept alongside the code
+chat/
+*.zip
+*.bak
+
+# Python / uv
+__pycache__/
+.venv/
+
+# Local tooling
+.DS_Store
+.claude/
+.idea/

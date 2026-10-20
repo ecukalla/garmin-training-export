@@ -1,0 +1,15 @@
+version: 2
+updates:
+  - package-ecosystem: "uv"          # reads pyproject.toml + uv.lock
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    allow:
+      # also the libraries garminconnect pulls in (requests, urllib3, certifi, …),
+      # not just the one listed in pyproject.toml
+      - dependency-type: "all"
+    groups:
+      # garminconnect gets its own PR; everything underneath it is bundled into one
+      supporting-libraries:
+        patterns: ["*"]
+        exclude-patterns: ["garminconnect"]

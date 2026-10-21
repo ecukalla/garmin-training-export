@@ -16,20 +16,9 @@ import sys
 import json
 from datetime import date, timedelta
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-OUT_DIR    = os.path.join(SCRIPT_DIR, "data", "_probe")
-TOKEN_STORE = os.environ.get("GARMINTOKENS", os.path.expanduser("~/.garminconnect"))
-CYCLE_TYPE_KEYS = ("cycl", "bik", "ride", "bmx")
+import garmin_export as gx      # same login, data dir and ride selection as the exporter
 
-
-def login():
-    from garminconnect import Garmin
-    g = Garmin()
-    try:
-        g.login(TOKEN_STORE)
-    except Exception as e:
-        sys.exit(f"Login failed ({e}).\nRun this once in a terminal:  garmin-mcp-auth")
-    return g
+OUT_DIR = gx.path("_probe")
 
 
 def dump(name, obj):
@@ -57,30 +46,20 @@ def find_keys(obj, needles, path=""):
 
 def pick_ride(g, explicit):
     if explicit:
-        url = f"/activity-service/activity/{explicit}"
-        a = g.connectapi(url)
-        return explicit, a
+        return explicit, g.get_activity(explicit)
     # newest cycling activity in the last ~120 days
     end = date.today().isoformat()
     start = (date.today() - timedelta(days=120)).isoformat()
-    try:
-        acts = g.get_activities_by_date(start, end, "cycling")
-    except Exception:
-        acts = g.get_activities_by_date(start, end)
-    rides = [a for a in acts
-             if any(k in (a.get("activityType", {}).get("typeKey", "") or "").lower()
-                    for k in CYCLE_TYPE_KEYS)]
+    rides = gx.cycle_list(g, start, end)          # oldest first
     if not rides:
         sys.exit("No cycling activities found in the last 120 days. "
                  "Pass an activity id explicitly: uv run cycle_probe.py <id>")
-    rides.sort(key=lambda a: a.get("startTimeLocal", ""), reverse=True)
-    a = rides[0]
-    return a["activityId"], a
+    return rides[-1]["activityId"], rides[-1]
 
 
 def main(argv):
     explicit = argv[0] if argv else None
-    g = login()
+    g = gx.login()
     print("authenticated\n")
 
     aid, summary_obj = pick_ride(g, explicit)
@@ -88,15 +67,14 @@ def main(argv):
     when = (summary_obj.get("startTimeLocal") or "")[:10]
     print(f"Ride: {aid}  {when}  {name!r}\n")
 
-    # the base activity object (where a workoutId, if any, lives)
-    base = g.connectapi(f"/activity-service/activity/{aid}")
+    # the base activity object (where a workoutId, if any, lives); pick_ride has
+    # already fetched it when given an id
+    base = summary_obj if explicit else g.get_activity(aid)
     dump("activity.json", base)
 
     # the splits (per-lap execution data we already export)
-    splits = None
     try:
-        splits = g.connectapi(f"/activity-service/activity/{aid}/splits")
-        dump("splits.json", splits)
+        dump("splits.json", g.get_activity_splits(aid))
     except Exception as e:
         print(f"  splits failed: {e}")
 
@@ -107,7 +85,7 @@ def main(argv):
     if workout_id:
         print(f"\n  workoutId = {workout_id} → fetching planned workout definition")
         try:
-            wk = g.connectapi(f"/workout-service/workout/{workout_id}")
+            wk = g.get_workout_by_id(workout_id)
             dump("workout.json", wk)
         except Exception as e:
             print(f"  workout fetch failed: {e}")

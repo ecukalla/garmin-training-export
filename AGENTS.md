@@ -26,7 +26,7 @@ There is no test suite, linter or formatter configured. `status` is the only com
 
 `garmin_export.py` is one file split into banner-delimited sections: shared helpers, then one section per domain (SWIM, CYCLE, RUN, DAILY, BODY, RAW), then `RUNNERS` + `main()`. `main()` parses args, logs in once, and calls each target's `<domain>_run(g, mode)`; a domain that raises is logged and the others still run (exit 1 at the end). `all` expands to `DOMAINS`, which excludes `raw`. For `status`, runners receive `g=None` — that is why `garminconnect` is imported lazily inside functions; keep it that way.
 
-Each domain section has the same shape: `<DOMAIN>_START` / `_OVERLAP` constants, CSV and state paths built with `path()`, `_COLS` lists that fix CSV column order, and `<domain>_list` → `<domain>_build` → `<domain>_run`. swim/cycle/run are near-copies of each other, so a change to one usually belongs in all three. Activity selection differs per domain: swim and run match on `typeKey` substrings, while cycle matches `typeId`/`parentTypeId == CYCLE_TYPE_ID` (name matching misses `enduro_mtb` and catches `motorcycling`).
+Each domain section has the same shape: `<DOMAIN>_START` / `_OVERLAP` constants, CSV and state paths built with `path()`, and `_COLS` lists that fix CSV column order. swim, cycle and run share one incremental loop, `activity_run()` (ACTIVITIES section): each defines `<domain>_list`, `<domain>_build` and a spec dict (`SWIM`, `CYCLE`, `RUN`) naming its files and nouns, and `<domain>_run` is a one-line wrapper — so changes to fetching, retries, merging or state go in `activity_run()`, not per domain. Cycle and run take their shared columns from `lap_base()` / `summary_base()`. Activity selection differs per domain: swim and run match on `typeKey` substrings, while cycle matches `typeId`/`parentTypeId == CYCLE_TYPE_ID` (name matching misses `enduro_mtb` and catches `motorcycling`).
 
 ### Incremental state and retries
 
@@ -40,7 +40,7 @@ Each domain section has the same shape: `<DOMAIN>_START` / `_OVERLAP` constants,
 
 Because `update` carries old rows forward from the CSV, a new column is only filled for activities fetched from then on — existing rows stay blank until `<domain> init` rebuilds the domain. When adding, renaming or removing a column, update the matching column table in `README.md`. The command examples are duplicated in the module docstring, `USAGE` and `README.md`; keep them in sync.
 
-`swim_build(g, a, splits=...)` accepts an already-fetched splits response, so it can be run offline against a cached `data/raw/<id>.json.gz` (`list_object` + `endpoints.splits`). The cycle/run builders don't support this yet.
+The builders are pure — `<domain>_build(a, splits)` returns `(child rows, summary row)` and never calls Garmin — so any of them can be run offline against a cached `data/raw/<id>.json.gz` (`list_object` + `endpoints.splits`).
 
 ## Data and privacy
 

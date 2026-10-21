@@ -197,6 +197,10 @@ def _num(d, key, nd=1):
     return round(v, nd) if isinstance(v, (int, float)) else ""
 
 
+def _typekey(a):
+    return ((a.get("activityType") or {}).get("typeKey") or "").lower()
+
+
 def is_transient(e):
     """Whether a failed Garmin call is worth asking again on a later run: rate limits,
     auth hiccups, 5xx and dropped connections. A 4xx (404 = nothing there) or a response
@@ -233,10 +237,24 @@ def safe(fn, default=None, pause=0.0, failures=None):
         return default
 
 
-def retry_note(state):
-    """Status-line suffix for whatever the last run couldn't fetch."""
-    n = len(state.get("failed") or state.get("failed_days") or [])
+def retry_note(n):
+    """Status-line suffix for however many items the last run couldn't fetch."""
     return f", {n} awaiting retry" if n else ""
+
+
+def overlap_start(state, days):
+    """Where `update` starts: `days` before the last pull, but never before the domain's
+    start date."""
+    last = state.get("last_updated") or state["start_date"]
+    return max((datetime.fromisoformat(last) - timedelta(days=days)).date().isoformat(),
+               state["start_date"])
+
+
+def year_windows(start, end):
+    """The ISO dates [start, end] cut at year boundaries, as (lo, hi) ISO pairs."""
+    d0, d1 = date.fromisoformat(start), date.fromisoformat(end)
+    return [(max(d0, date(y, 1, 1)).isoformat(), min(d1, date(y, 12, 31)).isoformat())
+            for y in range(d0.year, d1.year + 1)]
 
 
 def fetch_splits(g, aid):
@@ -248,8 +266,140 @@ def fetch_splits(g, aid):
     except Exception as e:
         if is_transient(e):
             raise
-        print(f"   no splits for {aid}: {e}", file=sys.stderr)
+        log(f"no splits for {aid}: {e}", icon="!")
         return {}
+
+
+# ===========================================================================
+# ACTIVITIES  — the incremental loop swim, cycle and run share
+#
+# Each of those domains is a spec dict (its names, files, and list/build functions) that
+# activity_run() drives. Builders are pure — build(a, splits) -> (child rows, summary row) —
+# so they work the same on a fresh splits response or on one from the raw cache, and any
+# view can be rebuilt offline.
+# ===========================================================================
+def list_activities(g, start, end, garmin_type, keep):
+    """Activities in [start, end] that `keep` accepts, oldest first. Asks Garmin for
+    `garmin_type` only, falling back to every activity if that filter fails."""
+    try:
+        acts = g.get_activities_by_date(start, end, garmin_type)
+    except Exception:
+        acts = g.get_activities_by_date(start, end)
+    return sorted(filter(keep, acts), key=lambda a: a.get("startTimeLocal", ""))
+
+
+def _head(a):
+    """The four columns every activity row starts with."""
+    return {"activity_id": a["activityId"], "date": (a.get("startTimeLocal") or "")[:10],
+            "activity_name": a.get("activityName") or "", "type": a["activityType"]["typeKey"]}
+
+
+def lap_base(head, i, L):
+    """The lap columns cycle and run share; each adds its sport's own."""
+    return {**head, "lap_index": i,
+            "distance_m": _num(L, "distance"),
+            "duration_s": _num(L, "duration"),
+            "moving_duration_s": _num(L, "movingDuration"),
+            "avg_speed_kmh": kmh(L.get("averageSpeed")),
+            "avg_hr": L.get("averageHR", ""), "max_hr": L.get("maxHR", ""),
+            "avg_power_w": _num(L, "averagePower", 0), "max_power_w": _num(L, "maxPower", 0),
+            "normalized_power_w": _num(L, "normalizedPower", 0),
+            "elevation_gain_m": _num(L, "elevationGain"),
+            "calories": L.get("calories", ""),
+            "intensity_type": L.get("intensityType") or ""}
+
+
+def summary_base(head, a, num_laps):
+    """The summary columns cycle and run share; each adds its sport's own."""
+    return {**head,
+            "distance_km": round(a["distance"] / 1000, 2) if a.get("distance") else "",
+            "duration_s": _num(a, "duration"),
+            "moving_duration_s": _num(a, "movingDuration"),
+            "elevation_gain_m": _num(a, "elevationGain"),
+            "elevation_loss_m": _num(a, "elevationLoss"),
+            "avg_speed_kmh": kmh(a.get("averageSpeed")),
+            "avg_hr": _num(a, "averageHR", 0), "max_hr": a.get("maxHR", ""),
+            "avg_power_w": _num(a, "avgPower", 0), "max_power_w": _num(a, "maxPower", 0),
+            "normalized_power_w": _num(a, "normPower", 0),
+            "calories": _num(a, "calories", 0),
+            "aerobic_te": _num(a, "aerobicTrainingEffect"),
+            "anaerobic_te": _num(a, "anaerobicTrainingEffect"),
+            "num_laps": num_laps}
+
+
+def activity_run(g, mode, d):
+    """One activity domain: a summary row per activity plus its child rows ("parts": pool
+    lengths or laps). Each activity is fetched once and remembered in the state file."""
+    name, noun, part = d["name"], d["noun"], d["part"]
+    n_key, parts_key = f"num_{noun}s", f"num_{part}_rows"
+    default = {"start_date": d["start"], "last_updated": None,
+               "processed_ids": [], n_key: 0, parts_key: 0}
+    state = load_state(d["state"], default)
+    today = date.today().isoformat()
+
+    if mode == "status":
+        pending = retry_note(len(state.get("failed") or {}))
+        print(f"  {name:<6}: {state[n_key]} {noun}s, {state.get(parts_key, 0)} {part} rows"
+              f"  (last {state['last_updated'] or 'never'}){pending}")
+        return
+    if mode == "auto":
+        mode = "update" if state.get("last_updated") else "init"
+
+    if mode == "init":
+        from_date = state["start_date"]
+        existing_summary, existing_parts, processed = [], [], set()
+        log(f"{name} INIT: {from_date} → {today}", icon="▶")
+    else:
+        from_date = min([overlap_start(state, d["overlap"])]
+                        + list(state.get("failed", {}).values()))   # reach back to retry
+        existing_summary = read_csv_list(d["summary_csv"])
+        existing_parts = read_csv_list(d["parts_csv"])
+        processed = set(str(x) for x in state.get("processed_ids", []))
+        log(f"{name} UPDATE: {from_date} → {today}  ({len(processed)} already pulled)", icon="▶")
+
+    acts = d["list"](g, from_date, today)
+    todo = [a for a in acts if str(a["activityId"]) not in processed]
+    log(f"{name}: {len(acts)} in range, {len(todo)} new to fetch")
+
+    new_parts, new_summary, failed, err = [], [], {}, None
+    prog = Progress(name, len(todo))
+    for a in todo:
+        aid, day = str(a["activityId"]), (a.get("startTimeLocal") or "")[:10]
+        try:
+            parts, summary = d["build"](a, fetch_splits(g, a["activityId"]))
+        except Exception as e:
+            failed[aid] = day or state["start_date"]
+            err = f"{type(e).__name__}: {e}"    # the text, not `e`: its traceback pins this frame
+            prog.step(f"{day} failed")
+        else:
+            new_parts.extend(parts)
+            new_summary.append(summary)
+            processed.add(aid)
+            prog.step(f"{day} ({len(parts)} {part}s)")
+        time.sleep(0.3)
+    if todo:
+        prog.done(f"{len(new_summary)} {noun}s, {len(new_parts)} {part}s")
+    if failed:
+        log(f"{name}: {len(failed)} {noun}s failed to fetch and will be retried next run "
+            f"(last error: {err})", icon="!")
+
+    all_summary = existing_summary + new_summary
+    all_parts = existing_parts + new_parts
+    all_summary.sort(key=lambda r: (str(r.get("date", "")), str(r.get("activity_id", ""))))
+    all_parts.sort(key=lambda r: (str(r.get("date", "")), str(r.get("activity_id", "")),
+                                  int(r.get(d["part_order"]) or 0)))
+    write_csv(d["summary_csv"], d["summary_cols"], all_summary)
+    write_csv(d["parts_csv"], d["parts_cols"], all_parts)
+
+    state.update({"last_updated": today,
+                  "processed_ids": sorted(processed, key=lambda x: int(x)),
+                  n_key: len(all_summary), parts_key: len(all_parts),
+                  "failed": failed,
+                  "generated_at": datetime.now().isoformat(timespec="seconds")})
+    save_state(d["state"], state)
+    log(f"{name}: +{len(new_summary)} new → {len(all_summary)} {noun}s / {len(all_parts)} {part}s "
+        f"written to {os.path.basename(d['summary_csv'])}, {os.path.basename(d['parts_csv'])}",
+        icon="✓")
 
 
 # ===========================================================================
@@ -291,26 +441,13 @@ def _rest_hr(samples):
 
 
 def swim_list(g, start, end):
-    try:
-        acts = g.get_activities_by_date(start, end, "swimming")
-    except Exception:
-        acts = g.get_activities_by_date(start, end)
-    swims = [a for a in acts
-             if "swim" in (a.get("activityType", {}).get("typeKey", "") or "").lower()]
-    swims.sort(key=lambda a: a.get("startTimeLocal", ""))
-    return swims
+    return list_activities(g, start, end, "swimming", lambda a: "swim" in _typekey(a))
 
 
-def swim_build(g, a, splits=None):
-    """Pass `splits` to build from an already-fetched response (e.g. the raw cache)
-    instead of calling Garmin — same logic either way, so views can be rebuilt offline."""
-    aid  = a["activityId"]
-    d    = (a.get("startTimeLocal") or "")[:10]
-    name = a.get("activityName") or ""
-    typ  = a["activityType"]["typeKey"]
-
-    if splits is None:
-        splits = fetch_splits(g, aid)
+def swim_build(a, splits):
+    """One row per pool length, grouped into sets by the rests between them, plus the
+    swim's summary row."""
+    head = _head(a)
     ordered = [L for lap in splits.get("lapDTOs") or [] for L in lap.get("lengthDTOs") or []]
 
     pool_len = None
@@ -322,7 +459,6 @@ def swim_build(g, a, splits=None):
     gn = 0
     tally = {}
     swolfs = []
-    active_count = 0
     rest_total = 0.0
     length_rows = []
 
@@ -345,7 +481,6 @@ def swim_build(g, a, splits=None):
                 rest_hr = (None, None)
             length_in_set += 1
             gn += 1
-            active_count += 1
             stroke  = L.get("swimStroke") or ""
             swolf   = L.get("averageSWOLF")
             strokes = L.get("totalNumberOfStrokes")
@@ -356,8 +491,7 @@ def swim_build(g, a, splits=None):
             if swolf is not None and not glitch:
                 swolfs.append(swolf)
             length_rows.append({
-                "activity_id": aid, "date": d, "activity_name": name, "type": typ,
-                "pool_length_m": pool_len, "set_index": set_idx,
+                **head, "pool_length_m": pool_len, "set_index": set_idx,
                 "length_in_set": length_in_set, "global_length_n": gn,
                 "distance_m": dist, "duration_s": round(dur, 1),
                 "pace_per_100m_s": pace100, "stroke": stroke,
@@ -383,9 +517,8 @@ def swim_build(g, a, splits=None):
     stroke_mix = "; ".join(f"{k}:{v}" for k, v in sorted(tally.items(), key=lambda x: -x[1]))
 
     summary_row = {
-        "activity_id": aid, "date": d, "activity_name": name, "type": typ,
-        "pool_length_m": pool_len or "",
-        "total_distance_m": _num(a, "distance"), "active_lengths": active_count,
+        **head, "pool_length_m": pool_len or "",
+        "total_distance_m": _num(a, "distance"), "active_lengths": gn,
         "total_duration_s": round(total_dur, 1) if total_dur else "",
         "moving_duration_s": round(moving_dur, 1) if moving_dur else "",
         "rest_time_s": round(rest_total, 1),
@@ -398,77 +531,15 @@ def swim_build(g, a, splits=None):
     return length_rows, summary_row
 
 
+SWIM = {"name": "swim", "noun": "swim", "part": "length", "part_order": "global_length_n",
+        "start": SWIM_START, "overlap": SWIM_OVERLAP, "state": SWIM_STATE,
+        "summary_csv": SWIM_SUMMARY_CSV, "summary_cols": SWIM_SUMMARY_COLS,
+        "parts_csv": SWIM_LENGTHS_CSV, "parts_cols": SWIM_LENGTH_COLS,
+        "list": swim_list, "build": swim_build}
+
+
 def swim_run(g, mode):
-    default = {"start_date": SWIM_START, "last_updated": None,
-               "processed_ids": [], "num_swims": 0, "num_length_rows": 0}
-    state = load_state(SWIM_STATE, default)
-    today = date.today().isoformat()
-
-    if mode == "status":
-        print(f"  swim  : {state['num_swims']} swims, {state['num_length_rows']} length rows"
-              f"  (last {state['last_updated'] or 'never'}){retry_note(state)}")
-        return
-    if mode == "auto":
-        mode = "update" if state.get("last_updated") else "init"
-
-    if mode == "init":
-        from_date = state["start_date"]
-        existing_summary, existing_lengths, processed = [], [], set()
-        log(f"swim {mode.upper()}: {from_date} → {today}", icon="▶")
-    else:
-        last = state.get("last_updated") or state["start_date"]
-        from_date = max((datetime.fromisoformat(last) - timedelta(days=SWIM_OVERLAP)).date().isoformat(),
-                        state["start_date"])
-        from_date = min([from_date] + list(state.get("failed", {}).values()))   # reach back to retry
-        existing_summary = read_csv_list(SWIM_SUMMARY_CSV)
-        existing_lengths = read_csv_list(SWIM_LENGTHS_CSV)
-        processed = set(str(x) for x in state.get("processed_ids", []))
-        log(f"swim {mode.upper()}: {from_date} → {today}  ({len(processed)} already pulled)", icon="▶")
-
-    swims = swim_list(g, from_date, today)
-    todo = [a for a in swims if str(a["activityId"]) not in processed]
-    log(f"swim: {len(swims)} in range, {len(todo)} new to fetch")
-
-    new_lengths, new_summary, added, failed, err = [], [], [], {}, None
-    prog = Progress("swim", len(todo))
-    for a in todo:
-        sr_date = (a.get("startTimeLocal") or "")[:10]
-        try:
-            lr, sr = swim_build(g, a)
-        except Exception as e:
-            failed[str(a["activityId"])] = sr_date or state["start_date"]
-            err = e
-            prog.step(f"{sr_date} failed")
-            time.sleep(0.3)
-            continue
-        new_lengths.extend(lr)
-        new_summary.append(sr)
-        added.append(str(a["activityId"]))
-        processed.add(str(a["activityId"]))
-        prog.step(f"{sr_date} ({len(lr)} lengths)")
-        time.sleep(0.3)
-    if todo:
-        prog.done(f"{len(added)} swims, {len(new_lengths)} lengths")
-    if failed:
-        log(f"swim: {len(failed)} swims failed to fetch and will be retried next run "
-            f"(last error: {type(err).__name__}: {err})", icon="!")
-
-    all_summary = existing_summary + new_summary
-    all_lengths = existing_lengths + new_lengths
-    all_summary.sort(key=lambda r: (str(r.get("date", "")), str(r.get("activity_id", ""))))
-    all_lengths.sort(key=lambda r: (str(r.get("date", "")), str(r.get("activity_id", "")),
-                                     int(r.get("global_length_n") or 0)))
-    write_csv(SWIM_SUMMARY_CSV, SWIM_SUMMARY_COLS, all_summary)
-    write_csv(SWIM_LENGTHS_CSV, SWIM_LENGTH_COLS, all_lengths)
-
-    state.update({"last_updated": today,
-                  "processed_ids": sorted(processed, key=lambda x: int(x)),
-                  "num_swims": len(all_summary), "num_length_rows": len(all_lengths),
-                  "failed": failed,
-                  "generated_at": datetime.now().isoformat(timespec="seconds")})
-    save_state(SWIM_STATE, state)
-    log(f"swim: +{len(added)} new → {len(all_summary)} swims / {len(all_lengths)} lengths "
-        f"written to {os.path.basename(SWIM_SUMMARY_CSV)}, {os.path.basename(SWIM_LENGTHS_CSV)}", icon="✓")
+    activity_run(g, mode, SWIM)
 
 
 # ===========================================================================
@@ -500,48 +571,25 @@ CYCLE_LAP_COLS = [
 ]
 
 
-def cycle_list(g, start, end):
-    try:
-        acts = g.get_activities_by_date(start, end, "cycling")
-    except Exception:
-        acts = g.get_activities_by_date(start, end)
+def _is_ride(a):
     # by parent type, not name: "enduro_mtb" has no "bik" in it, "motorcycling" does
-    rides = [a for a in acts
-             if CYCLE_TYPE_ID in ((a.get("activityType") or {}).get("typeId"),
-                                  (a.get("activityType") or {}).get("parentTypeId"))]
-    rides.sort(key=lambda a: a.get("startTimeLocal", ""))
-    return rides
+    t = a.get("activityType") or {}
+    return CYCLE_TYPE_ID in (t.get("typeId"), t.get("parentTypeId"))
 
 
-def cycle_build(g, a):
-    """Summary row off the activity object + one row per lap from the splits call."""
-    aid  = a["activityId"]
-    d    = (a.get("startTimeLocal") or "")[:10]
-    name = a.get("activityName") or ""
-    typ  = a["activityType"]["typeKey"]
+def cycle_list(g, start, end):
+    return list_activities(g, start, end, "cycling", _is_ride)
 
-    splits = fetch_splits(g, aid)
+
+def cycle_build(a, splits):
+    """Summary row off the activity object + one row per lap from its splits."""
+    head = _head(a)
     laps = splits.get("lapDTOs", []) or []
-
-    lap_rows = []
-    for i, L in enumerate(laps, start=1):
-        lap_rows.append({
-            "activity_id": aid, "date": d, "activity_name": name, "type": typ,
-            "lap_index": i,
-            "distance_m": _num(L, "distance"),
-            "duration_s": _num(L, "duration"),
-            "moving_duration_s": _num(L, "movingDuration"),
-            "avg_speed_kmh": kmh(L.get("averageSpeed")),
-            "max_speed_kmh": kmh(L.get("maxSpeed")),
-            "avg_hr": L.get("averageHR", ""), "max_hr": L.get("maxHR", ""),
-            "avg_power_w": _num(L, "averagePower", 0), "max_power_w": _num(L, "maxPower", 0),
-            "normalized_power_w": _num(L, "normalizedPower", 0),
-            "avg_cadence_rpm": _num(L, "averageBikeCadence", 0),
-            "max_cadence_rpm": _num(L, "maxBikeCadence", 0),
-            "elevation_gain_m": _num(L, "elevationGain"),
-            "calories": L.get("calories", ""),
-            "intensity_type": L.get("intensityType") or "",
-        })
+    lap_rows = [{**lap_base(head, i, L),
+                 "max_speed_kmh": kmh(L.get("maxSpeed")),
+                 "avg_cadence_rpm": _num(L, "averageBikeCadence", 0),
+                 "max_cadence_rpm": _num(L, "maxBikeCadence", 0)}
+                for i, L in enumerate(laps, start=1)]
 
     # The activity list never carries a ride's average temperature, but its laps do; their
     # duration-weighted mean matches Garmin's own ride average.
@@ -549,100 +597,23 @@ def cycle_build(g, a):
              if isinstance(L.get("averageTemperature"), (int, float)) and L.get("duration")]
     avg_temp = round(sum(t * s for t, s in temps) / sum(s for _, s in temps), 1) if temps else ""
 
-    summary = {
-        "activity_id": aid, "date": d, "activity_name": name, "type": typ,
-        "distance_km": round(a["distance"] / 1000, 2) if a.get("distance") else "",
-        "duration_s": _num(a, "duration"),
-        "moving_duration_s": _num(a, "movingDuration"),
-        "elevation_gain_m": _num(a, "elevationGain"),
-        "elevation_loss_m": _num(a, "elevationLoss"),
-        "avg_speed_kmh": kmh(a.get("averageSpeed")),
-        "max_speed_kmh": kmh(a.get("maxSpeed")),
-        "avg_hr": _num(a, "averageHR", 0), "max_hr": a.get("maxHR", ""),
-        "avg_cadence_rpm": _num(a, "averageBikingCadenceInRevPerMinute", 0),
-        "max_cadence_rpm": _num(a, "maxBikingCadenceInRevPerMinute", 0),
-        "avg_power_w": _num(a, "avgPower", 0), "max_power_w": _num(a, "maxPower", 0),
-        "normalized_power_w": _num(a, "normPower", 0),
-        "calories": _num(a, "calories", 0),
-        "avg_temp_c": avg_temp,
-        "aerobic_te": _num(a, "aerobicTrainingEffect"),
-        "anaerobic_te": _num(a, "anaerobicTrainingEffect"),
-        "num_laps": len(lap_rows),
-    }
+    summary = {**summary_base(head, a, len(lap_rows)),
+               "max_speed_kmh": kmh(a.get("maxSpeed")),
+               "avg_cadence_rpm": _num(a, "averageBikingCadenceInRevPerMinute", 0),
+               "max_cadence_rpm": _num(a, "maxBikingCadenceInRevPerMinute", 0),
+               "avg_temp_c": avg_temp}
     return lap_rows, summary
 
 
+CYCLE = {"name": "cycle", "noun": "ride", "part": "lap", "part_order": "lap_index",
+         "start": CYCLE_START, "overlap": CYCLE_OVERLAP, "state": CYCLE_STATE,
+         "summary_csv": CYCLE_SUMMARY_CSV, "summary_cols": CYCLE_SUMMARY_COLS,
+         "parts_csv": CYCLE_LAPS_CSV, "parts_cols": CYCLE_LAP_COLS,
+         "list": cycle_list, "build": cycle_build}
+
+
 def cycle_run(g, mode):
-    default = {"start_date": CYCLE_START, "last_updated": None,
-               "processed_ids": [], "num_rides": 0, "num_lap_rows": 0}
-    state = load_state(CYCLE_STATE, default)
-    today = date.today().isoformat()
-
-    if mode == "status":
-        print(f"  cycle : {state['num_rides']} rides, {state.get('num_lap_rows', 0)} lap rows"
-              f"  (last {state['last_updated'] or 'never'}){retry_note(state)}")
-        return
-    if mode == "auto":
-        mode = "update" if state.get("last_updated") else "init"
-
-    if mode == "init":
-        from_date = state["start_date"]
-        existing_summary, existing_laps, processed = [], [], set()
-        log(f"cycle {mode.upper()}: {from_date} → {today}", icon="▶")
-    else:
-        last = state.get("last_updated") or state["start_date"]
-        from_date = max((datetime.fromisoformat(last) - timedelta(days=CYCLE_OVERLAP)).date().isoformat(),
-                        state["start_date"])
-        from_date = min([from_date] + list(state.get("failed", {}).values()))   # reach back to retry
-        existing_summary = read_csv_list(CYCLE_SUMMARY_CSV)
-        existing_laps = read_csv_list(CYCLE_LAPS_CSV)
-        processed = set(str(x) for x in state.get("processed_ids", []))
-        log(f"cycle {mode.upper()}: {from_date} → {today}  ({len(processed)} already pulled)", icon="▶")
-
-    rides = cycle_list(g, from_date, today)
-    todo = [a for a in rides if str(a["activityId"]) not in processed]
-    log(f"cycle: {len(rides)} in range, {len(todo)} new to fetch")
-
-    new_laps, new_summary, added, failed, err = [], [], [], {}, None
-    prog = Progress("cycle", len(todo))
-    for a in todo:
-        r_date = (a.get("startTimeLocal") or "")[:10]
-        try:
-            lr, sr = cycle_build(g, a)
-        except Exception as e:
-            failed[str(a["activityId"])] = r_date or state["start_date"]
-            err = e
-            prog.step(f"{r_date} failed")
-            time.sleep(0.3)
-            continue
-        new_laps.extend(lr)
-        new_summary.append(sr)
-        added.append(str(a["activityId"]))
-        processed.add(str(a["activityId"]))
-        prog.step(f"{r_date} ({len(lr)} laps)")
-        time.sleep(0.3)
-    if todo:
-        prog.done(f"{len(added)} rides, {len(new_laps)} laps")
-    if failed:
-        log(f"cycle: {len(failed)} rides failed to fetch and will be retried next run "
-            f"(last error: {type(err).__name__}: {err})", icon="!")
-
-    all_summary = existing_summary + new_summary
-    all_laps = existing_laps + new_laps
-    all_summary.sort(key=lambda r: (str(r.get("date", "")), str(r.get("activity_id", ""))))
-    all_laps.sort(key=lambda r: (str(r.get("date", "")), str(r.get("activity_id", "")),
-                                 int(r.get("lap_index") or 0)))
-    write_csv(CYCLE_SUMMARY_CSV, CYCLE_SUMMARY_COLS, all_summary)
-    write_csv(CYCLE_LAPS_CSV, CYCLE_LAP_COLS, all_laps)
-
-    state.update({"last_updated": today,
-                  "processed_ids": sorted(processed, key=lambda x: int(x)),
-                  "num_rides": len(all_summary), "num_lap_rows": len(all_laps),
-                  "failed": failed,
-                  "generated_at": datetime.now().isoformat(timespec="seconds")})
-    save_state(CYCLE_STATE, state)
-    log(f"cycle: +{len(added)} new → {len(all_summary)} rides / {len(all_laps)} laps "
-        f"written to {os.path.basename(CYCLE_SUMMARY_CSV)}, {os.path.basename(CYCLE_LAPS_CSV)}", icon="✓")
+    activity_run(g, mode, CYCLE)
 
 
 # ===========================================================================
@@ -653,7 +624,6 @@ RUN_OVERLAP = 7
 RUN_SUMMARY_CSV = path("run_summary.csv")
 RUN_LAPS_CSV    = path("run_laps.csv")
 RUN_STATE       = path("run_export_state.json")
-RUN_TYPE_KEYS   = ("run",)   # running, trail_running, treadmill_running, track_running, …
 
 RUN_SUMMARY_COLS = [
     "activity_id", "date", "activity_name", "type",
@@ -677,148 +647,43 @@ RUN_LAP_COLS = [
 
 
 def run_list(g, start, end):
-    try:
-        acts = g.get_activities_by_date(start, end, "running")
-    except Exception:
-        acts = g.get_activities_by_date(start, end)
-    runs = [a for a in acts
-            if any(k in (a.get("activityType", {}).get("typeKey", "") or "").lower()
-                   for k in RUN_TYPE_KEYS)]
-    runs.sort(key=lambda a: a.get("startTimeLocal", ""))
-    return runs
+    # running, trail_running, treadmill_running, track_running, …
+    return list_activities(g, start, end, "running", lambda a: "run" in _typekey(a))
 
 
-def run_build(g, a):
-    """Summary row off the activity object + one row per lap from the splits call."""
-    aid  = a["activityId"]
-    d    = (a.get("startTimeLocal") or "")[:10]
-    name = a.get("activityName") or ""
-    typ  = a["activityType"]["typeKey"]
-
-    splits = fetch_splits(g, aid)
+def run_build(a, splits):
+    """Summary row off the activity object + one row per lap from its splits."""
+    head = _head(a)
     laps = splits.get("lapDTOs", []) or []
-
-    lap_rows = []
-    for i, L in enumerate(laps, start=1):
-        lap_rows.append({
-            "activity_id": aid, "date": d, "activity_name": name, "type": typ,
-            "lap_index": i,
-            "distance_m": _num(L, "distance"),
-            "duration_s": _num(L, "duration"),
-            "moving_duration_s": _num(L, "movingDuration"),
-            "pace_per_km": pace_per_km(L.get("averageSpeed")),
-            "avg_speed_kmh": kmh(L.get("averageSpeed")),
-            "avg_hr": L.get("averageHR", ""), "max_hr": L.get("maxHR", ""),
-            "avg_power_w": _num(L, "averagePower", 0), "max_power_w": _num(L, "maxPower", 0),
-            "normalized_power_w": _num(L, "normalizedPower", 0),
-            "avg_cadence_spm": _num(L, "averageRunCadence", 0),
-            "max_cadence_spm": _num(L, "maxRunCadence", 0),
-            "stride_length_cm": _num(L, "strideLength"),
-            "ground_contact_ms": _num(L, "groundContactTime"),
-            "vertical_oscillation_cm": _num(L, "verticalOscillation"),
-            "elevation_gain_m": _num(L, "elevationGain"),
-            "calories": L.get("calories", ""),
-            "intensity_type": L.get("intensityType") or "",
-        })
-
-    summary = {
-        "activity_id": aid, "date": d, "activity_name": name, "type": typ,
-        "distance_km": round(a["distance"] / 1000, 2) if a.get("distance") else "",
-        "duration_s": _num(a, "duration"),
-        "moving_duration_s": _num(a, "movingDuration"),
-        "avg_pace_per_km": pace_per_km(a.get("averageSpeed")),
-        "avg_speed_kmh": kmh(a.get("averageSpeed")),
-        "elevation_gain_m": _num(a, "elevationGain"),
-        "elevation_loss_m": _num(a, "elevationLoss"),
-        "avg_hr": _num(a, "averageHR", 0), "max_hr": a.get("maxHR", ""),
-        "avg_cadence_spm": _num(a, "averageRunningCadenceInStepsPerMinute", 0),
-        "max_cadence_spm": _num(a, "maxRunningCadenceInStepsPerMinute", 0),
-        "avg_stride_length_cm": _num(a, "avgStrideLength"),
-        "avg_power_w": _num(a, "avgPower", 0), "max_power_w": _num(a, "maxPower", 0),
-        "normalized_power_w": _num(a, "normPower", 0),
-        "avg_ground_contact_ms": _num(a, "avgGroundContactTime"),
-        "avg_vertical_oscillation_cm": _num(a, "avgVerticalOscillation"),
-        "avg_vertical_ratio": _num(a, "avgVerticalRatio"),
-        "calories": _num(a, "calories", 0),
-        "aerobic_te": _num(a, "aerobicTrainingEffect"),
-        "anaerobic_te": _num(a, "anaerobicTrainingEffect"),
-        "training_effect_label": a.get("trainingEffectLabel", ""),
-        "num_laps": len(lap_rows),
-    }
+    lap_rows = [{**lap_base(head, i, L),
+                 "pace_per_km": pace_per_km(L.get("averageSpeed")),
+                 "avg_cadence_spm": _num(L, "averageRunCadence", 0),
+                 "max_cadence_spm": _num(L, "maxRunCadence", 0),
+                 "stride_length_cm": _num(L, "strideLength"),
+                 "ground_contact_ms": _num(L, "groundContactTime"),
+                 "vertical_oscillation_cm": _num(L, "verticalOscillation")}
+                for i, L in enumerate(laps, start=1)]
+    summary = {**summary_base(head, a, len(lap_rows)),
+               "avg_pace_per_km": pace_per_km(a.get("averageSpeed")),
+               "avg_cadence_spm": _num(a, "averageRunningCadenceInStepsPerMinute", 0),
+               "max_cadence_spm": _num(a, "maxRunningCadenceInStepsPerMinute", 0),
+               "avg_stride_length_cm": _num(a, "avgStrideLength"),
+               "avg_ground_contact_ms": _num(a, "avgGroundContactTime"),
+               "avg_vertical_oscillation_cm": _num(a, "avgVerticalOscillation"),
+               "avg_vertical_ratio": _num(a, "avgVerticalRatio"),
+               "training_effect_label": a.get("trainingEffectLabel", "")}
     return lap_rows, summary
 
 
+RUN = {"name": "run", "noun": "run", "part": "lap", "part_order": "lap_index",
+       "start": RUN_START, "overlap": RUN_OVERLAP, "state": RUN_STATE,
+       "summary_csv": RUN_SUMMARY_CSV, "summary_cols": RUN_SUMMARY_COLS,
+       "parts_csv": RUN_LAPS_CSV, "parts_cols": RUN_LAP_COLS,
+       "list": run_list, "build": run_build}
+
+
 def run_run(g, mode):
-    default = {"start_date": RUN_START, "last_updated": None,
-               "processed_ids": [], "num_runs": 0, "num_lap_rows": 0}
-    state = load_state(RUN_STATE, default)
-    today = date.today().isoformat()
-
-    if mode == "status":
-        print(f"  run   : {state['num_runs']} runs, {state.get('num_lap_rows', 0)} lap rows"
-              f"  (last {state['last_updated'] or 'never'}){retry_note(state)}")
-        return
-    if mode == "auto":
-        mode = "update" if state.get("last_updated") else "init"
-
-    if mode == "init":
-        from_date = state["start_date"]
-        existing_summary, existing_laps, processed = [], [], set()
-        log(f"run {mode.upper()}: {from_date} → {today}", icon="▶")
-    else:
-        last = state.get("last_updated") or state["start_date"]
-        from_date = max((datetime.fromisoformat(last) - timedelta(days=RUN_OVERLAP)).date().isoformat(),
-                        state["start_date"])
-        from_date = min([from_date] + list(state.get("failed", {}).values()))   # reach back to retry
-        existing_summary = read_csv_list(RUN_SUMMARY_CSV)
-        existing_laps = read_csv_list(RUN_LAPS_CSV)
-        processed = set(str(x) for x in state.get("processed_ids", []))
-        log(f"run {mode.upper()}: {from_date} → {today}  ({len(processed)} already pulled)", icon="▶")
-
-    runs = run_list(g, from_date, today)
-    todo = [a for a in runs if str(a["activityId"]) not in processed]
-    log(f"run: {len(runs)} in range, {len(todo)} new to fetch")
-
-    new_laps, new_summary, added, failed, err = [], [], [], {}, None
-    prog = Progress("run", len(todo))
-    for a in todo:
-        r_date = (a.get("startTimeLocal") or "")[:10]
-        try:
-            lr, sr = run_build(g, a)
-        except Exception as e:
-            failed[str(a["activityId"])] = r_date or state["start_date"]
-            err = e
-            prog.step(f"{r_date} failed")
-            time.sleep(0.3)
-            continue
-        new_laps.extend(lr)
-        new_summary.append(sr)
-        added.append(str(a["activityId"]))
-        processed.add(str(a["activityId"]))
-        prog.step(f"{r_date} ({len(lr)} laps)")
-        time.sleep(0.3)
-    if todo:
-        prog.done(f"{len(added)} runs, {len(new_laps)} laps")
-    if failed:
-        log(f"run: {len(failed)} runs failed to fetch and will be retried next run "
-            f"(last error: {type(err).__name__}: {err})", icon="!")
-
-    all_summary = existing_summary + new_summary
-    all_laps = existing_laps + new_laps
-    all_summary.sort(key=lambda r: (str(r.get("date", "")), str(r.get("activity_id", ""))))
-    all_laps.sort(key=lambda r: (str(r.get("date", "")), str(r.get("activity_id", "")),
-                                 int(r.get("lap_index") or 0)))
-    write_csv(RUN_SUMMARY_CSV, RUN_SUMMARY_COLS, all_summary)
-    write_csv(RUN_LAPS_CSV, RUN_LAP_COLS, all_laps)
-
-    state.update({"last_updated": today,
-                  "processed_ids": sorted(processed, key=lambda x: int(x)),
-                  "num_runs": len(all_summary), "num_lap_rows": len(all_laps),
-                  "failed": failed,
-                  "generated_at": datetime.now().isoformat(timespec="seconds")})
-    save_state(RUN_STATE, state)
-    log(f"run: +{len(added)} new → {len(all_summary)} runs / {len(all_laps)} laps "
-        f"written to {os.path.basename(RUN_SUMMARY_CSV)}, {os.path.basename(RUN_LAPS_CSV)}", icon="✓")
+    activity_run(g, mode, RUN)
 
 
 # ===========================================================================
@@ -888,7 +753,7 @@ def daily_weekly_sample(g, dstr, failures):
     ts = safe(lambda: g.get_training_status(dstr), {}, DAILY_PAUSE, failures) or {}
     vo2 = ((ts.get("mostRecentVO2Max") or {}).get("generic") or {}).get("vo2MaxValue", "")
     fa = safe(lambda: g.get_fitnessage_data(dstr), {}, DAILY_PAUSE, failures) or {}
-    fitness_age = round(fa["fitnessAge"], 1) if isinstance(fa.get("fitnessAge"), (int, float)) else ""
+    fitness_age = _num(fa, "fitnessAge")
     d = datetime.fromisoformat(dstr).date()
     es = safe(lambda: g.get_endurance_score((d - timedelta(days=6)).isoformat(), dstr), {},
               DAILY_PAUSE, failures) or {}
@@ -903,7 +768,7 @@ def daily_run(g, mode):
 
     if mode == "status":
         print(f"  daily : {state['num_days']} days  (last {state['last_updated'] or 'never'})"
-              f"{retry_note(state)}")
+              f"{retry_note(len(state.get('failed_days') or []))}")
         return
     if mode == "auto":
         mode = "update" if state.get("last_updated") else "init"
@@ -915,9 +780,7 @@ def daily_run(g, mode):
         log(f"daily INIT: {from_date} → {today}  ({ndays} days, ~{ndays * 4} API calls — this is slow)",
             icon="▶")
     else:
-        last = state.get("last_updated") or state["start_date"]
-        from_date = max(datetime.fromisoformat(last).date() - timedelta(days=DAILY_OVERLAP),
-                        datetime.fromisoformat(state["start_date"]).date())
+        from_date = date.fromisoformat(overlap_start(state, DAILY_OVERLAP))
         rows = read_csv_by_key(DAILY_CSV, "date")
         # days an earlier run couldn't fetch, however old — otherwise they'd stay blank for good
         retry = {datetime.fromisoformat(s).date() for s in state.get("failed_days", [])}
@@ -988,17 +851,13 @@ def body_pull_weight(g):
     """Every weigh-in, a year per call. A year that fails to fetch keeps its rows from the
     last run rather than vanishing from the CSV."""
     rows, failed = {}, []
-    start = datetime.fromisoformat(BODY_START).date()
-    today = date.today()
-    nchunks = today.year - start.year + 1
-    prog = Progress("weigh-ins", nchunks)
-    d = start
-    while d <= today:
-        chunk_end = min(d.replace(year=d.year + 1) - timedelta(days=1), today)
+    years = year_windows(BODY_START, date.today().isoformat())
+    prog = Progress("weigh-ins", len(years))
+    for lo, hi in years:
         try:
-            wi = g.get_weigh_ins(d.isoformat(), chunk_end.isoformat()) or {}
+            wi = g.get_weigh_ins(lo, hi) or {}
         except Exception:
-            failed.append((d.isoformat(), chunk_end.isoformat()))
+            failed.append((lo, hi))
             wi = {}
         time.sleep(0.2)
         for day in wi.get("dailyWeightSummaries", []) or []:
@@ -1006,7 +865,7 @@ def body_pull_weight(g):
                 rows[m.get("samplePk")] = {
                     "date": (m.get("calendarDate") or "")[:10],
                     "weight_kg": round(m["weight"] / 1000, 2) if m.get("weight") else "",
-                    "bmi": round(m["bmi"], 1) if isinstance(m.get("bmi"), (int, float)) else "",
+                    "bmi": _num(m, "bmi"),
                     "body_fat_pct": m.get("bodyFat", ""),
                     "body_water_pct": m.get("bodyWater", ""),
                     "muscle_mass_kg": round(m["muscleMass"] / 1000, 2) if m.get("muscleMass") else "",
@@ -1016,8 +875,7 @@ def body_pull_weight(g):
                     "physique_rating": m.get("physiqueRating", ""),
                     "source": m.get("sourceType", ""),
                 }
-        prog.step(f"{d.year}: {len(rows)} so far")
-        d = chunk_end + timedelta(days=1)
+        prog.step(f"{lo[:4]}: {len(rows)} so far")
     prog.done(f"{len(rows)} weigh-ins")
     kept = [r for r in read_csv_list(WEIGHT_CSV)
             if any(lo <= r["date"] <= hi for lo, hi in failed)]
@@ -1079,10 +937,8 @@ def body_pull_race(g):
 
 def body_run(g, mode):
     if mode == "status":
-        def cnt(p):
-            return (sum(1 for _ in open(p)) - 1) if os.path.exists(p) else 0
-        print(f"  body  : {cnt(WEIGHT_CSV)} weigh-ins, {cnt(PR_CSV)} PRs, "
-              f"{cnt(RACE_CSV)} race predictions")
+        print(f"  body  : {len(read_csv_list(WEIGHT_CSV))} weigh-ins, "
+              f"{len(read_csv_list(PR_CSV))} PRs, {len(read_csv_list(RACE_CSV))} race predictions")
         return
     log("body ▶ refreshing weigh-ins + PRs + race predictions", icon="▶")
     nw = body_pull_weight(g)
@@ -1117,10 +973,6 @@ RAW_MAXCHART = 20000             # time series at native resolution (~1 sample/s
 RAW_MAXPOLY  = 4000              # GPS polyline points
 RAW_SAVE_EVERY = 25              # checkpoint the manifest this often
 RAW_SET_KEYS = ("strength", "fitness_equipment", "indoor_cardio")
-
-
-def _typekey(a):
-    return ((a.get("activityType") or {}).get("typeKey") or "").lower()
 
 
 # name -> (fetch, applies?). `applies` reads the already-fetched list object so we
@@ -1169,6 +1021,15 @@ def raw_write(p, obj):
     with gzip.open(tmp, "wt", encoding="utf-8") as f:
         json.dump(obj, f, default=str)
     os.replace(tmp, p)
+
+
+def raw_read(p):
+    with gzip.open(p, "rt", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def raw_files():
+    return os.listdir(RAW_DIR) if os.path.isdir(RAW_DIR) else []
 
 
 def raw_fetch(fn, tries=3):
@@ -1251,15 +1112,11 @@ def raw_account(g):
 def raw_list_all(g, start, end):
     """Every activity in the window, every type — a year at a time so no one
     response gets huge and a mid-run failure only costs that year."""
-    d0 = datetime.fromisoformat(start).date()
-    d1 = datetime.fromisoformat(end).date()
     acts, seen, out = [], set(), []
-    for y in range(d0.year, d1.year + 1):
-        lo = max(d0, date(y, 1, 1)).isoformat()
-        hi = min(d1, date(y, 12, 31)).isoformat()
+    for lo, hi in year_windows(start, end):
         chunk, err = raw_fetch(lambda: g.get_activities_by_date(lo, hi))
         if err:
-            log(f"raw: listing {y} failed: {err}", icon="✗")
+            log(f"raw: listing {lo[:4]} failed: {err}", icon="✗")
         else:
             acts.extend(chunk or [])
     for a in acts:
@@ -1273,10 +1130,8 @@ def raw_list_all(g, start, end):
 def raw_cached_ids():
     """What's already on disk — the source of truth for resuming, not the manifest.
     `<id>.partial.json.gz` fails the int() and is correctly excluded."""
-    if not os.path.isdir(RAW_DIR):
-        return set()
     ids = set()
-    for f in os.listdir(RAW_DIR):
+    for f in raw_files():
         if f.endswith(".json.gz"):
             try:
                 ids.add(int(f[:-len(".json.gz")]))
@@ -1289,24 +1144,15 @@ def raw_incomplete_ids():
     """Cached files that hit a transient failure and are worth fetching again. Reads
     every file, so it's `init`-only — `update` relies on the .partial naming instead."""
     bad = set()
-    if not os.path.isdir(RAW_DIR):
-        return bad
-    for f in os.listdir(RAW_DIR):
-        if not f.endswith(".json.gz") or f.endswith(".partial.json.gz"):
-            continue
-        p = os.path.join(RAW_DIR, f)
+    for aid in raw_cached_ids():
         try:
-            with gzip.open(p, "rt", encoding="utf-8") as fh:
-                rec = json.load(fh)
+            rec = raw_read(raw_path(aid))
         except Exception as e:
-            log(f"raw: {f} unreadable ({type(e).__name__}) — will re-fetch", icon="!")
-            try:
-                bad.add(int(f[:-len(".json.gz")]))
-            except ValueError:
-                pass
+            log(f"raw: {aid}.json.gz unreadable ({type(e).__name__}) — will re-fetch", icon="!")
+            bad.add(aid)
             continue
-        if raw_retryable(rec) and rec.get("activity_id"):
-            bad.add(rec["activity_id"])
+        if raw_retryable(rec):
+            bad.add(aid)
     return bad
 
 
@@ -1314,23 +1160,18 @@ def raw_partial_list_objects():
     """List objects of the captures parked as .partial. `update` only lists recent activity,
     so without these an older incomplete capture would wait for the next `init`."""
     out = []
-    if not os.path.isdir(RAW_DIR):
-        return out
-    for f in os.listdir(RAW_DIR):
+    for f in raw_files():
         if not f.endswith(".partial.json.gz"):
             continue
         try:
-            with gzip.open(os.path.join(RAW_DIR, f), "rt", encoding="utf-8") as fh:
-                out.append(json.load(fh)["list_object"])
+            out.append(raw_read(os.path.join(RAW_DIR, f))["list_object"])
         except Exception as e:
             log(f"raw: {f} unreadable ({type(e).__name__}) — `raw init` will re-fetch it", icon="!")
     return out
 
 
 def raw_disk_bytes():
-    if not os.path.isdir(RAW_DIR):
-        return 0
-    return sum(os.path.getsize(os.path.join(RAW_DIR, f)) for f in os.listdir(RAW_DIR)
+    return sum(os.path.getsize(os.path.join(RAW_DIR, f)) for f in raw_files()
                if f.endswith(".json.gz"))
 
 
@@ -1359,9 +1200,7 @@ def raw_run(g, mode):
     # `init` rescans all of history for gaps; `update` only looks at recent activity
     # (plus anything left .partial). Both skip whatever is already on disk, so either is
     # safe to re-run.
-    from_date = state["start_date"] if mode == "init" else (
-        max((datetime.fromisoformat(state.get("last_updated") or state["start_date"])
-             - timedelta(days=RAW_OVERLAP)).date().isoformat(), state["start_date"]))
+    from_date = state["start_date"] if mode == "init" else overlap_start(state, RAW_OVERLAP)
     if mode == "init" and have:
         log(f"raw: verifying {len(have)} cached files …")
         broken = raw_incomplete_ids()
@@ -1413,14 +1252,15 @@ def raw_run(g, mode):
         log(f"raw: {n_partial} activities hit network failures and were left incomplete — "
             f"re-run `raw update` to retry them", icon="!")
 
+    nbytes = raw_disk_bytes()
     state.update({"last_updated": today, "schema": RAW_SCHEMA,
                   "num_activities": len(have),
                   "num_with_errors": n_err,
-                  "bytes_on_disk": raw_disk_bytes(),
+                  "bytes_on_disk": nbytes,
                   "generated_at": datetime.now().isoformat(timespec="seconds")})
     save_state(RAW_STATE, state)
     log(f"raw: +{len(todo)} new → {len(have)} activities cached, "
-        f"{raw_disk_bytes() / 1e6:.0f} MB in {os.path.basename(RAW_DIR)}/", icon="✓")
+        f"{nbytes / 1e6:.0f} MB in {os.path.basename(RAW_DIR)}/", icon="✓")
 
 
 # ===========================================================================

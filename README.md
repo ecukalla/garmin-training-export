@@ -75,7 +75,8 @@ uv run garmin_export.py raw update       # cache anything new since the last raw
 uv run garmin_export.py status           # report all domains; fetches nothing
 ```
 
-- `init` = full rebuild from that domain's START_DATE
+- `init` = full rebuild — swim, cycle, run and raw from your first activity of that kind on
+  Garmin (found automatically); daily and body from their start constant (see below)
 - `update` = incremental (uses a small date overlap to catch late-synced data)
 - `auto` = init on first run, else update
 - `status` skips login entirely (just reads the CSVs/state)
@@ -355,8 +356,10 @@ To update by hand instead: `uv lock --upgrade` (or `--upgrade-package garminconn
 | `SWIM_OUTPUT_DIR` | `./data` (next to the script) | Where the CSVs + state files are written. |
 | `GARMINTOKENS` | `~/.garminconnect` | Garmin OAuth token store. |
 
-Each domain has a `*_START` constant in its section of `garmin_export.py`
-(`SWIM_START`, `CYCLE_START`, `RUN_START`, `DAILY_START`, `BODY_START`, `RAW_START`)
-controlling how far back a fresh `init` goes — swim/cycle/run default to `2016-01-01`, daily
-to `2022-12-01`, body (weigh-ins) to `2018-01-01`, raw to `2015-01-01`. On `update`, the
-stored last-pull date in `data/*_state.json` governs instead.
+swim, cycle, run and raw need no start date: `init` asks Garmin for everything since
+`EARLIEST` (`2000-01-01`) and records the date of your first activity as `start_date` in
+the domain's state file (`status` shows it as `first …`; `update` keeps it current).
+daily and body still start from a constant in their section of `garmin_export.py`, because
+they fetch day by day / year by year and every extra day costs requests: `DAILY_START`
+(`2022-12-01`) and `BODY_START` (`2018-01-01`). On `update`, the stored last-pull date in
+`data/*_state.json` governs instead.

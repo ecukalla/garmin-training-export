@@ -65,6 +65,10 @@ TOKEN_STORE = os.environ.get("GARMINTOKENS", os.path.expanduser("~/.garminconnec
 DOMAINS = ("swim", "cycle", "run", "daily", "body")   # what `all` expands to
 RAW_DOMAIN = "raw"                                    # opt-in only — never part of `all`
 MODES   = ("init", "update", "status", "auto")
+# Activity syncs (swim, cycle, run, raw) list from here on `init` and then record your first
+# activity as their start. Empty years are cheap: Garmin pages by result, and raw lists
+# year by year, so an empty year costs it one request.
+EARLIEST = "2000-01-01"
 
 def path(name):
     return os.path.join(OUTPUT_DIR, name)
@@ -355,23 +359,24 @@ def activity_run(g, mode, d):
     lengths or laps). Each activity is fetched once and remembered in the state file."""
     name, noun, part = d["name"], d["noun"], d["part"]
     n_key, parts_key = f"num_{noun}s", f"num_{part}_rows"
-    default = {"start_date": d["start"], "last_updated": None,
+    default = {"start_date": EARLIEST, "last_updated": None,
                "processed_ids": [], n_key: 0, parts_key: 0}
     state = load_state(d["state"], default)
     today = date.today().isoformat()
 
     if mode == "status":
         pending = retry_note(len(state.get("failed") or {}))
+        first = f"first {state['start_date']}, " if state[n_key] else ""
         print(f"  {name:<6}: {state[n_key]} {noun}s, {state.get(parts_key, 0)} {part} rows"
-              f"  (last {state['last_updated'] or 'never'}){pending}")
+              f"  ({first}last {state['last_updated'] or 'never'}){pending}")
         return
     if mode == "auto":
         mode = "update" if state.get("last_updated") else "init"
 
     if mode == "init":
-        from_date = state["start_date"]
+        from_date = EARLIEST                # the first activity is learned from the data
         existing_summary, existing_parts, processed = [], [], set()
-        log(f"{name} INIT: {from_date} → {today}", icon="▶")
+        log(f"{name} INIT: every {noun} on Garmin → {today}", icon="▶")
     else:
         from_date = min([overlap_start(state, d["overlap"])]
                         + list(state.get("failed", {}).values()))   # reach back to retry
@@ -418,6 +423,8 @@ def activity_run(g, mode, d):
     write_csv(d["parts_csv"], d["parts_cols"], all_parts)
 
     state.update({"last_updated": today,
+                  # rows are sorted by date, so the first is your first activity
+                  "start_date": all_summary[0]["date"] if all_summary else state["start_date"],
                   "processed_ids": sorted(processed, key=lambda x: int(x)),
                   n_key: len(all_summary), parts_key: len(all_parts),
                   "failed": failed,
@@ -431,7 +438,6 @@ def activity_run(g, mode, d):
 # ===========================================================================
 # SWIM  — one row per swim + one row per pool length
 # ===========================================================================
-SWIM_START   = "2016-01-01"
 SWIM_OVERLAP = 7
 SWIM_SUMMARY_CSV = path("swim_summary.csv")
 SWIM_LENGTHS_CSV = path("swim_lengths.csv")
@@ -558,7 +564,7 @@ def swim_build(a, splits):
 
 
 SWIM = frozendict(name="swim", noun="swim", part="length", part_order="global_length_n",
-                  start=SWIM_START, overlap=SWIM_OVERLAP, state=SWIM_STATE,
+                  overlap=SWIM_OVERLAP, state=SWIM_STATE,
                   summary_csv=SWIM_SUMMARY_CSV, summary_cols=SWIM_SUMMARY_COLS,
                   parts_csv=SWIM_LENGTHS_CSV, parts_cols=SWIM_LENGTH_COLS,
                   list=swim_list, build=swim_build)
@@ -571,7 +577,6 @@ def swim_run(g, mode):
 # ===========================================================================
 # CYCLE  — one row per ride
 # ===========================================================================
-CYCLE_START   = "2016-01-01"
 CYCLE_OVERLAP = 7
 CYCLE_SUMMARY_CSV = path("cycle_summary.csv")
 CYCLE_LAPS_CSV    = path("cycle_laps.csv")
@@ -632,7 +637,7 @@ def cycle_build(a, splits):
 
 
 CYCLE = frozendict(name="cycle", noun="ride", part="lap", part_order="lap_index",
-                   start=CYCLE_START, overlap=CYCLE_OVERLAP, state=CYCLE_STATE,
+                   overlap=CYCLE_OVERLAP, state=CYCLE_STATE,
                    summary_csv=CYCLE_SUMMARY_CSV, summary_cols=CYCLE_SUMMARY_COLS,
                    parts_csv=CYCLE_LAPS_CSV, parts_cols=CYCLE_LAP_COLS,
                    list=cycle_list, build=cycle_build)
@@ -645,7 +650,6 @@ def cycle_run(g, mode):
 # ===========================================================================
 # RUN  — one row per run + one row per lap
 # ===========================================================================
-RUN_START   = "2016-01-01"
 RUN_OVERLAP = 7
 RUN_SUMMARY_CSV = path("run_summary.csv")
 RUN_LAPS_CSV    = path("run_laps.csv")
@@ -702,7 +706,7 @@ def run_build(a, splits):
 
 
 RUN = frozendict(name="run", noun="run", part="lap", part_order="lap_index",
-                 start=RUN_START, overlap=RUN_OVERLAP, state=RUN_STATE,
+                 overlap=RUN_OVERLAP, state=RUN_STATE,
                  summary_csv=RUN_SUMMARY_CSV, summary_cols=RUN_SUMMARY_COLS,
                  parts_csv=RUN_LAPS_CSV, parts_cols=RUN_LAP_COLS,
                  list=run_list, build=run_build)
@@ -987,7 +991,6 @@ def body_run(g, mode):
 # swim/cycle/run) and keeps the raw responses on disk, so any later view can be built
 # offline. It is deliberately excluded from `all` — a full pull is ~2.5 hours.
 # ===========================================================================
-RAW_START    = "2015-01-01"
 RAW_DIR      = path("raw")
 RAW_ACCOUNT  = path("raw_account.json.gz")
 RAW_STATE    = path("raw_export_state.json")
@@ -1199,7 +1202,7 @@ def raw_disk_bytes():
 
 
 def raw_run(g, mode):
-    default = {"start_date": RAW_START, "last_updated": None, "schema": RAW_SCHEMA,
+    default = {"start_date": EARLIEST, "last_updated": None, "schema": RAW_SCHEMA,
                "num_activities": 0, "num_with_errors": 0}
     state = load_state(RAW_STATE, default)
     today = date.today().isoformat()
@@ -1223,7 +1226,7 @@ def raw_run(g, mode):
     # `init` rescans all of history for gaps; `update` only looks at recent activity
     # (plus anything left .partial). Both skip whatever is already on disk, so either is
     # safe to re-run.
-    from_date = state["start_date"] if mode == "init" else overlap_start(state, RAW_OVERLAP)
+    from_date = EARLIEST if mode == "init" else overlap_start(state, RAW_OVERLAP)
     if mode == "init" and have:
         log(f"raw: verifying {len(have)} cached files …")
         broken = raw_incomplete_ids()
@@ -1237,6 +1240,8 @@ def raw_run(g, mode):
     raw_account(g)
 
     acts = raw_list_all(g, from_date, today)
+    if mode == "init" and acts:            # oldest first, so this is your first activity
+        state["start_date"] = acts[0]["startTimeLocal"][:10]
     if mode == "update":
         listed = {a["activityId"] for a in acts}
         retry = [a for a in raw_partial_list_objects() if a.get("activityId") not in listed]

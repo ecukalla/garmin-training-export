@@ -11,6 +11,7 @@ __pycache__/
 .venv/
 
 # Local tooling
+.metrics/          # crapper / dryer / mutator reports
 .DS_Store
 .claude/
 .idea/

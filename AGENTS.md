@@ -18,7 +18,7 @@ uv sync                                   # install the versions pinned in uv.lo
 uv lock --upgrade-package garminconnect   # manual dependency bump
 ```
 
-There is no test suite or formatter; lint with `ruff check .` (config in `pyproject.toml`). `status` is the only command that is safe to run freely: every other mode logs into the owner's real Garmin account (tokens in `~/.garminconnect`, override with `GARMINTOKENS`), is subject to Garmin's rate limits, and rewrites files in `data/`. `daily init` takes ~20–30 min and `raw init` ~2.5 h — don't start those unasked. If login fails, the owner re-authenticates interactively with `garmin-mcp-auth`.
+Tests: `uv run python -m unittest` (stdlib only, fully offline — `tests/__init__.py` points `SWIM_OUTPUT_DIR` at a temp dir and `tests/stubs.py` replaces Garmin with `StubGarmin`; never use real `data/` in a test). No formatter; lint with `uv run ruff check .` (config in `pyproject.toml`; ruff and coverage are pinned in the `dev` dependency group), which also caps every function at McCabe complexity 9 (`C901`) — split a function rather than raising the cap. `status` is the only command that is safe to run freely: every other mode logs into the owner's real Garmin account (tokens in `~/.garminconnect`, override with `GARMINTOKENS`), is subject to Garmin's rate limits, and rewrites files in `data/`. `daily init` takes ~20–30 min and `raw init` ~2.5 h — don't start those unasked. If login fails, the owner re-authenticates interactively with `garmin-mcp-auth`.
 
 `cycle_probe.py` is a one-off, read-only exploration script (dumps raw JSON to `data/_probe/`); it is not part of the export.
 
@@ -26,7 +26,7 @@ There is no test suite or formatter; lint with `ruff check .` (config in `pyproj
 
 `garmin_export.py` is one file split into banner-delimited sections: shared helpers, then one section per domain (SWIM, CYCLE, RUN, DAILY, BODY, RAW), then `RUNNERS` + `main()`. `main()` parses args, logs in once, and calls each target's `<domain>_run(g, mode)`; a domain that raises is logged and the others still run (exit 1 at the end). `all` expands to `DOMAINS`, which excludes `raw`. For `status`, runners receive `g=None` — that is why `garminconnect` and `requests` are PEP 810 `lazy import`s at the top of the module: they load on first use, so `status` never imports them. Keep them `lazy` (the keyword only works at module level, not inside functions).
 
-Each domain section has the same shape: `<DOMAIN>_OVERLAP` constants (plus `DAILY_START` / `BODY_START`; activity syncs have no start constant — `init` lists from `EARLIEST` and stores the first activity's date as `start_date`), CSV and state paths built with `path()`, and `_COLS` lists that fix CSV column order. swim, cycle and run share one incremental loop, `activity_run()` (ACTIVITIES section): each defines `<domain>_list`, `<domain>_build` and a spec `frozendict` (`SWIM`, `CYCLE`, `RUN`) naming its files and nouns, and `<domain>_run` is a one-line wrapper — so changes to fetching, retries, merging or state go in `activity_run()`, not per domain. Cycle and run take their shared columns from `lap_base()` / `summary_base()`. Activity selection differs per domain: swim and run match on `typeKey` substrings, while cycle matches `typeId`/`parentTypeId == CYCLE_TYPE_ID` (name matching misses `enduro_mtb` and catches `motorcycling`).
+Each domain section has the same shape: `<DOMAIN>_OVERLAP` constants (plus `DAILY_START` / `BODY_START`; activity syncs have no start constant — `init` lists from `EARLIEST` and stores the first activity's date as `start_date`), CSV and state paths built with `path()`, and `_COLS` lists that fix CSV column order. swim, cycle and run share one incremental loop, `activity_run()` (ACTIVITIES section): each defines `<domain>_list`, `<domain>_build` and a spec `frozendict` (`SWIM`, `CYCLE`, `RUN`) naming its files and nouns, and `<domain>_run` is a one-line wrapper — so changes to fetching, retries, merging or state go in `activity_run()` and its steps (`activity_plan` / `activity_fetch` / `activity_save`), not per domain. daily and raw follow the same plan → fetch → save split, and every runner resolves `auto` through `resolve_mode()`. Cycle and run take their shared columns from `lap_base()` / `summary_base()`. Activity selection differs per domain: swim and run match on `typeKey` substrings, while cycle matches `typeId`/`parentTypeId == CYCLE_TYPE_ID` (name matching misses `enduro_mtb` and catches `motorcycling`).
 
 ### Incremental state and retries
 
@@ -46,6 +46,10 @@ The builders are pure — `<domain>_build(a, splits)` returns `(child rows, summ
 ## Data and privacy
 
 `data/` (personal health data), `chat/`, `*.zip` and `*.bak` are git-ignored and must never be committed. Output goes to `data/` next to the script regardless of the working directory; `SWIM_OUTPUT_DIR` overrides it for **all** domains despite its name, and importing `garmin_export` creates that directory as a side effect.
+
+## CI
+
+`.github/workflows/quality.yml` runs on every pull request and push to `main`: ruff and the unittest suite, then Uncle Bob's gates on `garmin_export.py` — `crapper --threshold 9.99` (every function CRAP < 10) and `dryer --threshold 0.8` (no duplicate candidates) block; `mutator` reports survivors as a warning and in the job summary. The three tools are cloned at commit SHAs pinned in the workflow's `env`; bump them deliberately.
 
 ## Dependencies
 

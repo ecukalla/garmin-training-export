@@ -1409,35 +1409,49 @@ Args are order-independent. Examples:
 
 def main(argv):
     global QUIET
-    domain, mode = "all", "auto"
-    for a in argv:
-        al = a.lower()
-        if al in ("-h", "--help", "help"):
-            print(USAGE)
-            return
-        if al in ("-q", "--quiet"):
-            QUIET = True
-        elif al in DOMAINS or al in (RAW_DOMAIN, "all"):
-            domain = al
-        elif al in MODES:
-            mode = al
-        else:
-            sys.exit(f"Unknown arg: {a}\n\n{USAGE}")
-
+    args = parse_args(argv)
+    if args is None:
+        print(USAGE)
+        return
+    domain, mode, quiet = args
+    if quiet:
+        QUIET = True
     targets = list(DOMAINS) if domain == "all" else [domain]
-
     if mode == "status":
         print(f"Garmin export — data dir: {OUTPUT_DIR}")
         # raw is excluded from `all` for fetching, but reporting it costs nothing
         for t in (targets + [RAW_DOMAIN] if domain == "all" else targets):
             RUNNERS[t](None, "status")
         return
+    run_domains(targets, mode)
 
+
+def parse_args(argv):
+    """(domain, mode, quiet) from order-independent args, or None when help was asked for.
+    An unknown arg exits with the usage text."""
+    domain, mode, quiet = "all", "auto", False
+    for a in argv:
+        al = a.lower()
+        if al in ("-h", "--help", "help"):
+            return None
+        if al in ("-q", "--quiet"):
+            quiet = True
+        elif al in DOMAINS or al in (RAW_DOMAIN, "all"):
+            domain = al
+        elif al in MODES:
+            mode = al
+        else:
+            sys.exit(f"Unknown arg: {a}\n\n{USAGE}")
+    return domain, mode, quiet
+
+
+def run_domains(targets, mode):
+    """Log in once and run each domain; one that fails is logged and the rest still run,
+    then the exit code is 1."""
     log(f"Garmin export — domains: {', '.join(targets)} · mode: {mode} · dir: {OUTPUT_DIR}", icon="●")
     log("authenticating with saved Garmin tokens …")
     g = login()                         # single login shared across all domains
     log("authenticated", icon="✓")
-
     failed = []
     for t in targets:
         try:
@@ -1445,7 +1459,6 @@ def main(argv):
         except Exception as e:
             failed.append(t)
             log(f"{t} FAILED: {e}", icon="✗")
-
     if failed:
         log(f"finished with errors in: {', '.join(failed)} · total {fmt_dur(time.time() - _T0)}", icon="✗")
         sys.exit(1)

@@ -35,14 +35,15 @@ Args are order-independent: a domain (swim|cycle|run|daily|body|all, or raw) and
 (init|update|status). Defaults: domain=all, mode=auto.
 Auth: saved tokens; if login fails run `garmin-mcp-auth`.
 """
-import os
-import sys
 import csv
 import gzip
 import json
+import os
 import re
+import sys
 import time
 from datetime import date, datetime, timedelta
+from functools import partial
 
 # ---- shared config --------------------------------------------------------
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -66,7 +67,7 @@ IS_TTY = sys.stderr.isatty()
 
 def fmt_dur(seconds):
     """Human-readable duration: 1h02m, 3m05s, 12s."""
-    s = int(round(seconds))
+    s = round(seconds)
     if s >= 3600:
         return f"{s // 3600}h{(s % 3600) // 60:02d}m"
     if s >= 60:
@@ -121,7 +122,7 @@ class Progress:
 
     def done(self, summary):
         if IS_TTY and not QUIET:
-            print("", file=sys.stderr, flush=True)      # finish the in-place line
+            print(file=sys.stderr, flush=True)      # finish the in-place line
         log(f"{self.label}: {summary} in {fmt_dur(time.time() - self.start)}", icon="✓")
 
 
@@ -173,7 +174,7 @@ def write_csv(p, cols, rows):
 def fmt_time(seconds):
     if not isinstance(seconds, (int, float)):
         return ""
-    s = int(round(seconds))
+    s = round(seconds)
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
@@ -206,8 +207,12 @@ def is_transient(e):
     auth hiccups, 5xx and dropped connections. A 4xx (404 = nothing there) or a response
     that won't parse comes back the same every time, so that answer is final."""
     import requests
-    from garminconnect import (GarminConnectAuthenticationError, GarminConnectConnectionError,
-                               GarminConnectNotFoundError, GarminConnectTooManyRequestsError)
+    from garminconnect import (
+        GarminConnectAuthenticationError,
+        GarminConnectConnectionError,
+        GarminConnectNotFoundError,
+        GarminConnectTooManyRequestsError,
+    )
     if isinstance(e, (GarminConnectTooManyRequestsError, GarminConnectAuthenticationError)):
         return True
     if isinstance(e, GarminConnectNotFoundError) or not isinstance(e, GarminConnectConnectionError):
@@ -354,7 +359,7 @@ def activity_run(g, mode, d):
                         + list(state.get("failed", {}).values()))   # reach back to retry
         existing_summary = read_csv_list(d["summary_csv"])
         existing_parts = read_csv_list(d["parts_csv"])
-        processed = set(str(x) for x in state.get("processed_ids", []))
+        processed = {str(x) for x in state.get("processed_ids", [])}
         log(f"{name} UPDATE: {from_date} → {today}  ({len(processed)} already pulled)", icon="▶")
 
     acts = d["list"](g, from_date, today)
@@ -1065,7 +1070,7 @@ def raw_capture(g, a):
         if not applies(a):
             rec["skipped"].append(name)
             continue
-        v, err = raw_fetch(lambda: fetch(g, aid, a))
+        v, err = raw_fetch(partial(fetch, g, aid, a))
         if err:
             rec["errors"][name] = err
         else:
@@ -1114,7 +1119,7 @@ def raw_list_all(g, start, end):
     response gets huge and a mid-run failure only costs that year."""
     acts, seen, out = [], set(), []
     for lo, hi in year_windows(start, end):
-        chunk, err = raw_fetch(lambda: g.get_activities_by_date(lo, hi))
+        chunk, err = raw_fetch(partial(g.get_activities_by_date, lo, hi))
         if err:
             log(f"raw: listing {lo[:4]} failed: {err}", icon="✗")
         else:

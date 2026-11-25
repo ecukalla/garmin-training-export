@@ -11,12 +11,12 @@ Outputs raw JSON into ./data/_probe/ and prints a focused summary of any
 power / target / FTP / step keys it finds. Paste the summary back (or send the
 files) and I'll write the parser against the actual structure.
 """
+import json
 import os
 import sys
-import json
 from datetime import date, timedelta
 
-import garmin_export as gx      # same login, data dir and ride selection as the exporter
+import garmin_export as gx  # same login, data dir and ride selection as the exporter
 
 OUT_DIR = gx.path("_probe")
 

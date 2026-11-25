@@ -18,7 +18,7 @@ uv sync                                   # install the versions pinned in uv.lo
 uv lock --upgrade-package garminconnect   # manual dependency bump
 ```
 
-There is no test suite, linter or formatter configured. `status` is the only command that is safe to run freely: every other mode logs into the owner's real Garmin account (tokens in `~/.garminconnect`, override with `GARMINTOKENS`), is subject to Garmin's rate limits, and rewrites files in `data/`. `daily init` takes ~20–30 min and `raw init` ~2.5 h — don't start those unasked. If login fails, the owner re-authenticates interactively with `garmin-mcp-auth`.
+There is no test suite or formatter; lint with `ruff check .` (config in `pyproject.toml`). `status` is the only command that is safe to run freely: every other mode logs into the owner's real Garmin account (tokens in `~/.garminconnect`, override with `GARMINTOKENS`), is subject to Garmin's rate limits, and rewrites files in `data/`. `daily init` takes ~20–30 min and `raw init` ~2.5 h — don't start those unasked. If login fails, the owner re-authenticates interactively with `garmin-mcp-auth`.
 
 `cycle_probe.py` is a one-off, read-only exploration script (dumps raw JSON to `data/_probe/`); it is not part of the export.
 

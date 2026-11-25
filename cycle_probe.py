@@ -38,9 +38,8 @@ def find_keys(obj, needles, path=""):
             if any(n in k.lower() for n in needles) and not isinstance(v, (dict, list)):
                 hits.append((kp, v))
             hits.extend(find_keys(v, needles, kp))
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj[:3]):           # sample first few list items
-            hits.extend(find_keys(v, needles, f"{path}[{i}]"))
+    elif isinstance(obj, list):                   # sample first few list items
+        hits = [*find_keys(v, needles, f"{path}[{i}]") for i, v in enumerate(obj[:3])]
     return hits
 
 

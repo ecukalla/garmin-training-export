@@ -45,6 +45,16 @@ import time
 from datetime import date, datetime, timedelta
 from functools import partial
 
+# Loaded on first use (PEP 810), so `status` — which runs with g=None — never imports them.
+lazy import requests
+lazy from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectNotFoundError,
+    GarminConnectTooManyRequestsError,
+)
+
 # ---- shared config --------------------------------------------------------
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR  = os.environ.get("SWIM_OUTPUT_DIR", os.path.join(SCRIPT_DIR, "data"))
@@ -128,7 +138,6 @@ class Progress:
 
 # ---- shared helpers -------------------------------------------------------
 def login():
-    from garminconnect import Garmin
     g = Garmin()
     try:
         g.login(TOKEN_STORE)
@@ -206,13 +215,6 @@ def is_transient(e):
     """Whether a failed Garmin call is worth asking again on a later run: rate limits,
     auth hiccups, 5xx and dropped connections. A 4xx (404 = nothing there) or a response
     that won't parse comes back the same every time, so that answer is final."""
-    import requests
-    from garminconnect import (
-        GarminConnectAuthenticationError,
-        GarminConnectConnectionError,
-        GarminConnectNotFoundError,
-        GarminConnectTooManyRequestsError,
-    )
     if isinstance(e, (GarminConnectTooManyRequestsError, GarminConnectAuthenticationError)):
         return True
     if isinstance(e, GarminConnectNotFoundError) or not isinstance(e, GarminConnectConnectionError):
@@ -453,7 +455,7 @@ def swim_build(a, splits):
     """One row per pool length, grouped into sets by the rests between them, plus the
     swim's summary row."""
     head = _head(a)
-    ordered = [L for lap in splits.get("lapDTOs") or [] for L in lap.get("lengthDTOs") or []]
+    ordered = [*(lap.get("lengthDTOs") or []) for lap in splits.get("lapDTOs") or []]
 
     pool_len = None
     set_idx = 0
@@ -536,11 +538,11 @@ def swim_build(a, splits):
     return length_rows, summary_row
 
 
-SWIM = {"name": "swim", "noun": "swim", "part": "length", "part_order": "global_length_n",
-        "start": SWIM_START, "overlap": SWIM_OVERLAP, "state": SWIM_STATE,
-        "summary_csv": SWIM_SUMMARY_CSV, "summary_cols": SWIM_SUMMARY_COLS,
-        "parts_csv": SWIM_LENGTHS_CSV, "parts_cols": SWIM_LENGTH_COLS,
-        "list": swim_list, "build": swim_build}
+SWIM = frozendict(name="swim", noun="swim", part="length", part_order="global_length_n",
+                  start=SWIM_START, overlap=SWIM_OVERLAP, state=SWIM_STATE,
+                  summary_csv=SWIM_SUMMARY_CSV, summary_cols=SWIM_SUMMARY_COLS,
+                  parts_csv=SWIM_LENGTHS_CSV, parts_cols=SWIM_LENGTH_COLS,
+                  list=swim_list, build=swim_build)
 
 
 def swim_run(g, mode):
@@ -610,11 +612,11 @@ def cycle_build(a, splits):
     return lap_rows, summary
 
 
-CYCLE = {"name": "cycle", "noun": "ride", "part": "lap", "part_order": "lap_index",
-         "start": CYCLE_START, "overlap": CYCLE_OVERLAP, "state": CYCLE_STATE,
-         "summary_csv": CYCLE_SUMMARY_CSV, "summary_cols": CYCLE_SUMMARY_COLS,
-         "parts_csv": CYCLE_LAPS_CSV, "parts_cols": CYCLE_LAP_COLS,
-         "list": cycle_list, "build": cycle_build}
+CYCLE = frozendict(name="cycle", noun="ride", part="lap", part_order="lap_index",
+                   start=CYCLE_START, overlap=CYCLE_OVERLAP, state=CYCLE_STATE,
+                   summary_csv=CYCLE_SUMMARY_CSV, summary_cols=CYCLE_SUMMARY_COLS,
+                   parts_csv=CYCLE_LAPS_CSV, parts_cols=CYCLE_LAP_COLS,
+                   list=cycle_list, build=cycle_build)
 
 
 def cycle_run(g, mode):
@@ -680,11 +682,11 @@ def run_build(a, splits):
     return lap_rows, summary
 
 
-RUN = {"name": "run", "noun": "run", "part": "lap", "part_order": "lap_index",
-       "start": RUN_START, "overlap": RUN_OVERLAP, "state": RUN_STATE,
-       "summary_csv": RUN_SUMMARY_CSV, "summary_cols": RUN_SUMMARY_COLS,
-       "parts_csv": RUN_LAPS_CSV, "parts_cols": RUN_LAP_COLS,
-       "list": run_list, "build": run_build}
+RUN = frozendict(name="run", noun="run", part="lap", part_order="lap_index",
+                 start=RUN_START, overlap=RUN_OVERLAP, state=RUN_STATE,
+                 summary_csv=RUN_SUMMARY_CSV, summary_cols=RUN_SUMMARY_COLS,
+                 parts_csv=RUN_LAPS_CSV, parts_cols=RUN_LAP_COLS,
+                 list=run_list, build=run_build)
 
 
 def run_run(g, mode):
@@ -842,14 +844,14 @@ PR_COLS  = ["type_id", "label", "activity_type", "value_raw", "value_pretty",
             "units", "record_date"]
 RACE_COLS = ["pulled_date", "calendar_date", "distance", "time_seconds", "time_pretty"]
 
-PR_LABELS = {
+PR_LABELS = frozendict({
     1: ("Fastest 1 km", "time"), 2: ("Fastest 1 mile", "time"),
     3: ("Fastest 5 km", "time"), 4: ("Fastest 10 km", "time"),
     5: ("Fastest half marathon", "time"), 6: ("Fastest marathon", "time"),
     7: ("Longest run", "distance"), 8: ("Longest ride", "distance"),
     12: ("Most steps in a day", "count"), 13: ("Most steps in a week", "count"),
     14: ("Most steps in a month", "count"), 16: ("Most floors in a day", "count"),
-}
+})
 
 
 def body_pull_weight(g):
@@ -1040,7 +1042,6 @@ def raw_files():
 def raw_fetch(fn, tries=3):
     """Call fn with polite pacing. Backs off and retries on rate limits only;
     other failures return their message so the caller can record them."""
-    from garminconnect import GarminConnectTooManyRequestsError
     delay, err = RAW_BACKOFF, "gave up"
     for _ in range(tries):
         try:
@@ -1269,8 +1270,8 @@ def raw_run(g, mode):
 
 
 # ===========================================================================
-RUNNERS = {"swim": swim_run, "cycle": cycle_run, "run": run_run,
-           "daily": daily_run, "body": body_run, "raw": raw_run}
+RUNNERS = frozendict(swim=swim_run, cycle=cycle_run, run=run_run,
+                     daily=daily_run, body=body_run, raw=raw_run)
 
 
 USAGE = f"""Garmin exporter — export Garmin Connect data to CSV in ./data

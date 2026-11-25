@@ -77,7 +77,10 @@ jobs:
       - name: Mutation testing (mutator) — survivors warn, they don't block
         run: |
           set +e
-          "$RUNNER_TEMP/unclebob/mutator/mutator" garmin_export.py 2>&1 | tee mutator.txt
+          # --no-coverage: coverage.py's LCOV lists only the first line of a multi-line
+          # statement, so mutator would skip every site on a continuation line as
+          # "uncovered". Nothing here is untested (the suite covers it all), so run them all.
+          "$RUNNER_TEMP/unclebob/mutator/mutator" --no-coverage garmin_export.py 2>&1 | tee mutator.txt
           code=${PIPESTATUS[0]}
           { echo "### Mutation testing (mutator)"; echo '```'; cat mutator.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           read -r _ killed survived uncovered sites score < <(grep '^Total' mutator.txt | tail -1)

@@ -1354,4 +1354,10 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        if IS_TTY:
+            print(file=sys.stderr)          # step off the "^C" or progress bar on this line
+        log("interrupted — no file was left half-written; rerun to continue", icon="✗")
+        sys.exit(130)

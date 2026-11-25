@@ -112,6 +112,18 @@ class SplitsReachTheBuilder(unittest.TestCase):
         self.assertEqual(rows(d["summary_csv"])[0]["active_lengths"], "2")
 
 
+class Listing(unittest.TestCase):
+    def test_if_garmin_rejects_the_type_filter_everything_is_listed_and_filtered_here(self):
+        class NoTypeFilter(StubGarmin):
+            def get_activities_by_date(self, start, end=None, *typed, **k):
+                if typed:
+                    raise ge.GarminConnectConnectionError("API Error 400")
+                return super().get_activities_by_date(start, end)
+        g = NoTypeFilter([act(2, "2026-01-02", "running"), act(1, "2026-01-01")])
+        self.assertEqual([a["activityId"] for a in ge.swim_list(g, "2026-01-01", "2026-12-31")],
+                         [1])
+
+
 class Status(unittest.TestCase):
     def test_status_before_any_run(self):
         self.assertIn("0 swims, 0 length rows  (last never)", status_line(spec(ge.SWIM, "never")))

@@ -13,3 +13,7 @@ updates:
       supporting-libraries:
         patterns: ["*"]
         exclude-patterns: ["garminconnect"]
+  - package-ecosystem: "github-actions"   # the actions used in .github/workflows
+    directory: "/"
+    schedule:
+      interval: "weekly"

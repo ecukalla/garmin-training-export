@@ -1,0 +1,77 @@
+name: Quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Uncle Bob's quality-gate tools (github.com/unclebob), pinned to reviewed commits so an
+  # upstream change can't alter or run new code in these checks unnoticed. Bump on purpose.
+  CRAPPER_SHA: c757ec79a6c15dc815238bbd9c2f4601eb54d3cc
+  DRYER_SHA: 66ff6d21a42c04afcad89c78a80066176d1294b0
+  MUTATOR_SHA: 0136cf555797f1c9552388c40207eb2f13af9535
+
+jobs:
+  test:
+    name: Lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - name: Install (Python 3.15 + locked dependencies)
+        run: uv sync --locked
+      - name: Lint — ruff, including the complexity cap
+        run: uv run ruff check .
+      - name: Tests — offline, no Garmin login
+        run: uv run python -m unittest -v
+
+  gates:
+    name: CRAP, duplication, mutation
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - name: Install the project (Python 3.15, coverage from the dev group)
+        run: uv sync --locked
+      - name: Python for the tools themselves
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Fetch crapper, dryer and mutator at their pinned commits
+        # side by side: mutator reads function names from ../crapper
+        run: |
+          for tool in crapper dryer mutator; do
+            sha_var="${tool^^}_SHA"
+            dir="$RUNNER_TEMP/unclebob/$tool"
+            git init -q "$dir"
+            git -C "$dir" fetch -q --depth 1 "https://github.com/unclebob/$tool.git" "${!sha_var}"
+            git -C "$dir" checkout -q FETCH_HEAD
+          done
+      - name: CRAP below 10 for every function (crapper)
+        run: '"$RUNNER_TEMP/unclebob/crapper/crapper" --threshold 9.99 garmin_export.py'
+      - name: No duplicated code at similarity 0.8 or above (dryer)
+        run: |
+          out="$("$RUNNER_TEMP/unclebob/dryer/dryer" --threshold 0.8 garmin_export.py)"
+          echo "$out"
+          grep -qx "No duplicate candidates found." <<<"$out"
+      - name: Mutation testing (mutator) — survivors warn, they don't block
+        run: |
+          set +e
+          "$RUNNER_TEMP/unclebob/mutator/mutator" garmin_export.py 2>&1 | tee mutator.txt
+          code=${PIPESTATUS[0]}
+          { echo "### Mutation testing (mutator)"; echo '```'; cat mutator.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" = 3 ]; then
+            echo "::warning title=Surviving mutants::Some mutants survived — see the job summary for which."
+            exit 0
+          fi
+          exit "$code"

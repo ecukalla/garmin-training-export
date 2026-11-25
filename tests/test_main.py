@@ -141,6 +141,15 @@ class MainStatus(MainCase):
         self.login.assert_not_called()
 
 
+class StatusWithRealRunners(unittest.TestCase):
+    def test_status_reports_every_domain_including_raw(self):
+        out, _, code = captured(ge.main, ["status"])
+        self.assertIsNone(code)
+        prefixes = [ln[:8] for ln in out.splitlines()[1:]]
+        self.assertEqual(prefixes, ["  swim  ", "  cycle ", "  run   ", "  daily ", "  body  ",
+                                    "  raw   "])
+
+
 class MainOutcome(MainCase):
     def test_success_logs_all_done(self):
         _, err, code = self.main("cycle")

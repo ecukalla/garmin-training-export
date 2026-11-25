@@ -56,9 +56,19 @@ jobs:
             git init -q "$dir"
             git -C "$dir" fetch -q --depth 1 "https://github.com/unclebob/$tool.git" "${!sha_var}"
             git -C "$dir" checkout -q FETCH_HEAD
+            "$dir/$tool" --help > /dev/null     # first run builds the tool's own venv
           done
       - name: CRAP below 10 for every function (crapper)
-        run: '"$RUNNER_TEMP/unclebob/crapper/crapper" --threshold 9.99 garmin_export.py'
+        run: |
+          set +e
+          "$RUNNER_TEMP/unclebob/crapper/crapper" --threshold 9.99 garmin_export.py > crap.txt
+          code=$?
+          cat crap.txt
+          { echo "### CRAP (crapper)"; echo '```'; cat crap.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          worst=$(awk '/^-+$/ { getline; print; exit }' crap.txt | tr -s ' ')
+          count=$(awk '/^-+$/ { body = 1; next } body && NF' crap.txt | wc -l)
+          echo "::notice title=crapper::${count} functions scored; worst: ${worst}"
+          exit "$code"
       - name: No duplicated code at similarity 0.8 or above (dryer)
         run: |
           out="$("$RUNNER_TEMP/unclebob/dryer/dryer" --threshold 0.8 garmin_export.py)"
@@ -70,6 +80,8 @@ jobs:
           "$RUNNER_TEMP/unclebob/mutator/mutator" garmin_export.py 2>&1 | tee mutator.txt
           code=${PIPESTATUS[0]}
           { echo "### Mutation testing (mutator)"; echo '```'; cat mutator.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          read -r _ killed survived uncovered sites score < <(grep '^Total' mutator.txt | tail -1)
+          echo "::notice title=mutator::killed ${killed} · survived ${survived} · uncovered ${uncovered} · sites ${sites} · score ${score}"
           if [ "$code" = 3 ]; then
             echo "::warning title=Surviving mutants::Some mutants survived — see the job summary for which."
             exit 0

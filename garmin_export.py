@@ -119,7 +119,7 @@ class Progress:
                 self._render(now, note, inplace=True)
                 self.last = now
         elif not QUIET:
-            every = max(1, self.total // 20) if self.total else 50   # ~5% milestones
+            every = max(1, self.total // 20)        # ~5% milestones
             if self.n % every == 0 or done:
                 self._render(now, note, inplace=False)
 
@@ -880,8 +880,7 @@ def daily_plan(state, mode, today):
 def daily_fetch(g, days, rows):
     """Fill `rows` with each day; returns the days to retry next run. Slow-moving metrics
     are sampled once per ISO week and carried forward, so a failed sample taints the week."""
-    cur_week = None
-    weekly, weekly_failed = {"vo2max": "", "endurance": "", "fitness_age": ""}, False
+    cur_week = weekly = weekly_failed = None    # the first day always samples its week
     failed_days = []
     prog = Progress("daily", len(days))
     for d in days:
@@ -1101,7 +1100,7 @@ RAW_RETRYABLE = ("GarminConnectConnectionError", "GarminConnectTooManyRequestsEr
 
 
 def raw_retryable(rec):
-    return any(str(e).split(":", 1)[0].strip() in RAW_RETRYABLE
+    return any(str(e).partition(":")[0].strip() in RAW_RETRYABLE
                for e in (rec.get("errors") or {}).values())
 
 
@@ -1270,8 +1269,7 @@ def raw_disk_bytes():
 
 def raw_run(g, mode):
     state = load_state(RAW_STATE, {"start_date": EARLIEST, "last_updated": None,
-                                   "schema": RAW_SCHEMA, "num_activities": 0,
-                                   "num_with_errors": 0})
+                                   "schema": RAW_SCHEMA})
     if mode == "status":
         print(f"  raw   : {len(raw_cached_ids())} activities cached, "
               f"{raw_disk_bytes() / 1e6:.0f} MB on disk"

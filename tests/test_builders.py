@@ -701,5 +701,27 @@ class Selection(unittest.TestCase):
         self.assertEqual(self.ids(ge.run_list, acts), [2, 1])
 
 
+
+class RoundedMaxima(unittest.TestCase):
+    """Power and cadence maxima are rounded to whole numbers like the averages."""
+
+    def test_cycle(self):
+        lap = {**RIDE_LAP, "maxPower": 402.6, "maxBikeCadence": 110.4}
+        a = ride(avgPower=180.6, maxPower=640.4, maxBikingCadenceInRevPerMinute=120.6)
+        laps_, summary = ge.cycle_build(a, {"lapDTOs": [lap]})
+        got, s = as_csv(laps_, ge.CYCLE_LAP_COLS)[0], as_csv([summary], ge.CYCLE_SUMMARY_COLS)[0]
+        self.assertEqual((got["max_power_w"], got["max_cadence_rpm"]), ("403.0", "110.0"))
+        self.assertEqual((s["avg_power_w"], s["max_power_w"], s["max_cadence_rpm"]),
+                         ("181.0", "640.0", "121.0"))
+
+    def test_run(self):
+        lap = {**RUN_LAP, "maxPower": 330.6, "maxRunCadence": 181.4}
+        a = run(avgPower=250.4, maxPower=400.6, maxRunningCadenceInStepsPerMinute=190.6)
+        laps_, summary = ge.run_build(a, {"lapDTOs": [lap]})
+        got, s = as_csv(laps_, ge.RUN_LAP_COLS)[0], as_csv([summary], ge.RUN_SUMMARY_COLS)[0]
+        self.assertEqual((got["max_power_w"], got["max_cadence_spm"]), ("331.0", "181.0"))
+        self.assertEqual((s["avg_power_w"], s["max_power_w"], s["max_cadence_spm"]),
+                         ("250.0", "401.0", "191.0"))
+
 if __name__ == "__main__":
     unittest.main()

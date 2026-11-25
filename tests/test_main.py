@@ -198,7 +198,7 @@ class Login(unittest.TestCase):
 class FmtDur(unittest.TestCase):
     def test_durations(self):
         cases = {0: "0s", 0.5: "0s", 1.5: "2s", 59.4: "59s", 59.5: "1m00s", 60: "1m00s",
-                 185: "3m05s", 3599: "59m59s", 3600: "1h00m", 3725: "1h02m",
+                 185: "3m05s", 3599: "59m59s", 3600: "1h00m", 3725: "1h02m", 7140: "1h59m",
                  90061: "25h01m", -5: "-5s"}
         for seconds, want in cases.items():
             self.assertEqual(ge.fmt_dur(seconds), want, seconds)
@@ -276,6 +276,29 @@ class ProgressRender(ProgressCase):
                          "  x [----------------------] 0/0    0% ·  0.0/s · ETA    0s\n")
 
 
+class ProgressEdges(ProgressCase):
+    def test_render_before_any_time_has_passed_shows_no_rate_or_eta(self):
+        p = ge.Progress("x", 10)
+        p.n = 3
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            p._render(100.0, "", inplace=False)
+        self.assertEqual(err.getvalue(),
+                         "  x [######----------------] 3/10   30% ·  0.0/s · ETA    0s\n")
+
+    def test_piped_milestones_are_every_twentieth_of_the_total(self):
+        self.mode(tty=False, quiet=False)
+        out = self.steps(ge.Progress("lbl", 100), [101.0] * 100)
+        counts = [ln.split("] ")[1].split("/")[0] for ln in out.splitlines()]
+        self.assertEqual(counts, [str(n) for n in range(5, 101, 5)])
+
+    def test_tty_redraws_once_exactly_0_15s_have_passed(self):
+        self.mode(tty=True, quiet=False)
+        self.clock.t = 0.0
+        p = ge.Progress("lbl", 3)
+        self.assertEqual(self.steps(p, [0.15]).count("\r"), 1)
+
+
 class ProgressStep(ProgressCase):
     def test_tty_redraws_in_place_at_most_every_0_15s_and_always_at_the_end(self):
         self.mode(tty=True, quiet=False)
@@ -300,7 +323,7 @@ class ProgressStep(ProgressCase):
         self.assertEqual(len(self.steps(ge.Progress("lbl", 3), [101.0] * 3).splitlines()), 3)
 
     def test_piped_with_no_total_prints_every_step(self):
-        """done is n >= 0, always true, so the every-50 fallback never applies."""
+        """With no total, done (n >= 0) is always true, so every step prints."""
         self.mode(tty=False, quiet=False)
         out = self.steps(ge.Progress("lbl", 0), [101.0] * 3)
         self.assertEqual([ln.split("] ")[1].split(" ")[0] for ln in out.splitlines()],

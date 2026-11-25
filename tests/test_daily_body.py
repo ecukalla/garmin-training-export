@@ -556,6 +556,22 @@ class BodyFailures(BodyCase):
         self.assertEqual(got[0]["source"], "MANUAL")
         self.assertEqual(self.state()["weigh_ins"], 2)
 
+    def test_kept_rows_include_both_edges_of_the_failed_window_and_the_year_is_named(self):
+        first, last = LAST_WINDOW
+        ge.write_csv(ge.WEIGHT_CSV, ge.WEIGHT_COLS, [{"date": first, "weight_kg": "71.0"},
+                                                     {"date": last, "weight_kg": "72.0"}])
+
+        def flaky(lo, hi):
+            if lo == first:
+                raise rate_limited()
+            return {}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            ge.body_pull_weight(StubGarmin(get_weigh_ins=flaky))
+        self.assertEqual([r["date"] for r in rows(ge.WEIGHT_CSV)], [first, last])
+        self.assertIn(f"weigh-ins for {LAST_YEAR} failed to fetch — kept their 2 rows",
+                      err.getvalue())
+
     def test_any_error_counts_as_a_failed_year_not_only_transient_ones(self):
         kept = f"{THIS_YEAR}-01-01"
         ge.write_csv(ge.WEIGHT_CSV, ge.WEIGHT_COLS, [{"date": kept, "weight_kg": "70.0"}])
@@ -734,6 +750,24 @@ class SmallHelpers(unittest.TestCase):
         self.assertEqual(ge.year_windows("2026-05-01", "2026-04-01"),
                          [("2026-05-01", "2026-04-01")])
 
+
+
+class RowRounding(unittest.TestCase):
+    """Units are converted and rounded to two decimals."""
+
+    def test_weigh_in_masses_are_kilograms_to_two_decimals(self):
+        row = ge.weigh_in_row(metric(1, "2026-02-03", weight=80123, muscleMass=33149,
+                                     boneMass=3201))
+        self.assertEqual((row["weight_kg"], row["muscle_mass_kg"], row["bone_mass_kg"]),
+                         (80.12, 33.15, 3.2))
+
+    def test_distance_records_are_kilometres_to_two_decimals(self):
+        self.assertEqual(ge.pr_row({"typeId": 7, "value": 21512.4})["value_pretty"], 21.51)
+
+    def test_sleep_hours_to_two_decimals(self):
+        row = ge.daily_row("2026-02-03", {}, {"dailySleepDTO": {"sleepTimeSeconds": 27022}},
+                           {}, {}, {})
+        self.assertEqual(row["sleep_hours"], 7.51)
 
 if __name__ == "__main__":
     unittest.main()

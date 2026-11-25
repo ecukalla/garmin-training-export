@@ -101,10 +101,27 @@ class Update(unittest.TestCase):
         self.assertEqual(ge.load_state(d["state"], {})["processed_ids"], ["4"])
 
 
+class SplitsReachTheBuilder(unittest.TestCase):
+    def test_init_builds_each_swim_from_its_splits(self):
+        d = spec(ge.SWIM, "splits")
+        lengths = [{"distance": 25.0, "duration": 30.0}, {"distance": 25.0, "duration": 31.0}]
+        g = StubGarmin([act(8, "2026-05-06")],
+                       get_activity_splits={"lapDTOs": [{"lengthDTOs": lengths}]})
+        ge.activity_run(g, "init", d)
+        self.assertEqual([r["duration_s"] for r in rows(d["parts_csv"])], ["30.0", "31.0"])
+        self.assertEqual(rows(d["summary_csv"])[0]["active_lengths"], "2")
+
+
 class Status(unittest.TestCase):
     def test_status_before_any_run(self):
         self.assertIn("0 swims, 0 length rows  (last never)", status_line(spec(ge.SWIM, "never")))
 
+
+    def test_status_of_a_state_written_before_part_rows_were_counted(self):
+        d = spec(ge.SWIM, "legacy")
+        ge.save_state(d["state"], {"start_date": "2020-01-01", "last_updated": "2026-01-01",
+                                   "processed_ids": [1], "num_swims": 1})
+        self.assertIn("1 swims, 0 length rows", status_line(d))
 
 if __name__ == "__main__":
     unittest.main()

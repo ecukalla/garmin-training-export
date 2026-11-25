@@ -375,9 +375,12 @@ def activity_run(g, mode, d):
     else:
         from_date = min([overlap_start(state, d["overlap"])]
                         + list(state.get("failed", {}).values()))   # reach back to retry
-        existing_summary = read_csv_list(d["summary_csv"])
-        existing_parts = read_csv_list(d["parts_csv"])
         processed = {str(x) for x in state.get("processed_ids", [])}
+        # The state file is written last, so it is what commits a run: rows of an activity it
+        # never recorded come from an interrupted run, and that activity is fetched again.
+        existing_summary, existing_parts = (
+            [r for r in read_csv_list(d[k]) if r["activity_id"] in processed]
+            for k in ("summary_csv", "parts_csv"))
         log(f"{name} UPDATE: {from_date} → {today}  ({len(processed)} already pulled)", icon="▶")
 
     acts = d["list"](g, from_date, today)

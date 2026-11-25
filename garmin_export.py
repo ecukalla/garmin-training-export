@@ -772,11 +772,26 @@ DAILY_COLS = [
 
 
 def daily_day_row(g, dstr, weekly, failures):
-    us = safe(lambda: g.get_user_summary(dstr), {}, DAILY_PAUSE, failures) or {}
-    sl = (safe(lambda: g.get_sleep_data(dstr), {}, DAILY_PAUSE, failures) or {}).get("dailySleepDTO", {}) or {}
-    hv = (safe(lambda: g.get_hrv_data(dstr), {}, DAILY_PAUSE, failures) or {}).get("hrvSummary", {}) or {}
-    tr = safe(lambda: g.get_training_readiness(dstr), None, DAILY_PAUSE, failures)
-    tr0 = (tr[0] if isinstance(tr, list) and tr else (tr if isinstance(tr, dict) else {})) or {}
+    """One day's row. A call that fails counts as no data, and a transient failure is
+    recorded in `failures` so the day is fetched again next run."""
+    def get(endpoint):
+        return safe(lambda: endpoint(dstr), None, DAILY_PAUSE, failures) or {}
+    return daily_row(dstr, get(g.get_user_summary), get(g.get_sleep_data),
+                     get(g.get_hrv_data), get(g.get_training_readiness), weekly)
+
+
+def _readiness(tr):
+    """Training readiness arrives as a list of readings (latest first) or as one dict."""
+    if isinstance(tr, list):
+        return (tr[0] if tr else {}) or {}
+    return tr if isinstance(tr, dict) else {}
+
+
+def daily_row(dstr, us, sleep, hrv, readiness, weekly):
+    """A day's CSV row from Garmin's per-day answers ({} where there was none)."""
+    sl = sleep.get("dailySleepDTO") or {}
+    hv = hrv.get("hrvSummary") or {}
+    tr0 = _readiness(readiness)
     sleep_overall = (sl.get("sleepScores") or {}).get("overall") or {}
     return {
         "date": dstr,
@@ -825,17 +840,26 @@ def daily_weekly_sample(g, dstr, failures):
 
 
 def daily_run(g, mode):
-    default = {"start_date": DAILY_START, "last_updated": None, "num_days": 0}
-    state = load_state(DAILY_STATE, default)
-    today = date.today()
-
+    state = load_state(DAILY_STATE, {"start_date": DAILY_START, "last_updated": None,
+                                     "num_days": 0})
     if mode == "status":
         print(f"  daily : {state['num_days']} days  (last {state['last_updated'] or 'never'})"
               f"{retry_note(len(state.get('failed_days') or []))}")
         return
-    if mode == "auto":
-        mode = "update" if state.get("last_updated") else "init"
+    today = date.today()
+    days, rows = daily_plan(state, resolve_mode(mode, state), today)
+    failed_days = daily_fetch(g, days, rows)
+    write_csv(DAILY_CSV, DAILY_COLS, [rows[k] for k in sorted(rows)])
+    state.update({"last_updated": today.isoformat(), "num_days": len(rows),
+                  "failed_days": failed_days,
+                  "generated_at": datetime.now().isoformat(timespec="seconds")})
+    save_state(DAILY_STATE, state)
+    log(f"daily: +{len(days)} processed → {len(rows)} days written to {os.path.basename(DAILY_CSV)}",
+        icon="✓")
 
+
+def daily_plan(state, mode, today):
+    """The days to fetch, oldest first, and the rows (by date) to merge them into."""
     if mode == "init":
         from_date = datetime.fromisoformat(state["start_date"]).date()
         rows, retry = {}, set()
@@ -850,8 +874,12 @@ def daily_run(g, mode):
         ndays = (today - from_date).days + 1
         log(f"daily UPDATE: {from_date} → {today}  ({ndays} days"
             + (f" + {len(retry)} to retry" if retry else "") + ")", icon="▶")
+    return sorted({from_date + timedelta(days=i) for i in range(ndays)} | retry), rows
 
-    days = sorted({from_date + timedelta(days=i) for i in range(ndays)} | retry)
+
+def daily_fetch(g, days, rows):
+    """Fill `rows` with each day; returns the days to retry next run. Slow-moving metrics
+    are sampled once per ISO week and carried forward, so a failed sample taints the week."""
     cur_week = None
     weekly, weekly_failed = {"vo2max": "", "endurance": "", "fitness_age": ""}, False
     failed_days = []
@@ -863,7 +891,7 @@ def daily_run(g, mode):
             cur_week = wk
             wf = []
             weekly = daily_weekly_sample(g, dstr, wf)
-            weekly_failed = bool(wf)        # carried forward, so the whole week is suspect
+            weekly_failed = bool(wf)
         failures = []
         rows[dstr] = daily_day_row(g, dstr, weekly, failures)
         if failures or weekly_failed:
@@ -873,15 +901,7 @@ def daily_run(g, mode):
     if failed_days:
         log(f"daily: {len(failed_days)} days hit rate limits or network errors — "
             f"they'll be re-fetched on the next update", icon="!")
-
-    ordered = [rows[k] for k in sorted(rows)]
-    write_csv(DAILY_CSV, DAILY_COLS, ordered)
-    state.update({"last_updated": today.isoformat(), "num_days": len(rows),
-                  "failed_days": failed_days,
-                  "generated_at": datetime.now().isoformat(timespec="seconds")})
-    save_state(DAILY_STATE, state)
-    log(f"daily: +{len(days)} processed → {len(rows)} days written to {os.path.basename(DAILY_CSV)}",
-        icon="✓")
+    return failed_days
 
 
 # ===========================================================================

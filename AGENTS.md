@@ -8,7 +8,7 @@ A personal, single-file Python exporter (`garmin_export.py`) that pulls the owne
 
 ## Commands
 
-Python 3.14, managed with `uv` (`package = false` — scripts, not an installable package). Run from the repo root:
+Python 3.15, managed with `uv` (`package = false` — scripts, not an installable package). Run from the repo root:
 
 ```bash
 uv run garmin_export.py status            # reads CSVs/state only — no login, no network

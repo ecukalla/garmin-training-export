@@ -1269,19 +1269,38 @@ def raw_disk_bytes():
 
 
 def raw_run(g, mode):
-    default = {"start_date": EARLIEST, "last_updated": None, "schema": RAW_SCHEMA,
-               "num_activities": 0, "num_with_errors": 0}
-    state = load_state(RAW_STATE, default)
-    today = date.today().isoformat()
-
+    state = load_state(RAW_STATE, {"start_date": EARLIEST, "last_updated": None,
+                                   "schema": RAW_SCHEMA, "num_activities": 0,
+                                   "num_with_errors": 0})
     if mode == "status":
-        n = len(raw_cached_ids())
-        print(f"  raw   : {n} activities cached, {raw_disk_bytes() / 1e6:.0f} MB on disk"
+        print(f"  raw   : {len(raw_cached_ids())} activities cached, "
+              f"{raw_disk_bytes() / 1e6:.0f} MB on disk"
               f"  (last {state.get('last_updated') or 'never'})")
         return
-    if mode == "auto":
-        mode = "update" if state.get("last_updated") else "init"
+    today = date.today().isoformat()
+    mode, have, from_date = raw_plan(state, resolve_mode(mode, state), today)
+    log("raw: refreshing account snapshot (zones, FTP, devices, gear)")
+    raw_account(g)
+    todo = raw_todo(g, state, mode, from_date, today, have)
+    n_err = raw_fetch_all(g, todo, have, state)
 
+    nbytes = raw_disk_bytes()
+    state.update({"last_updated": today, "schema": RAW_SCHEMA,
+                  "num_activities": len(have),
+                  "num_with_errors": n_err,
+                  "bytes_on_disk": nbytes,
+                  "generated_at": datetime.now().isoformat(timespec="seconds")})
+    save_state(RAW_STATE, state)
+    log(f"raw: +{len(todo)} new → {len(have)} activities cached, "
+        f"{nbytes / 1e6:.0f} MB in {os.path.basename(RAW_DIR)}/", icon="✓")
+
+
+def raw_plan(state, mode, today):
+    """The effective mode, the activity IDs already cached, and where to list from.
+
+    `init` rescans all of history for gaps; `update` only looks at recent activity (plus
+    anything left .partial). Both skip whatever is already on disk, so either is safe to
+    re-run."""
     os.makedirs(RAW_DIR, exist_ok=True)
     have = raw_cached_ids()
     if state.get("schema") != RAW_SCHEMA:
@@ -1289,50 +1308,54 @@ def raw_run(g, mode):
             icon="!")
         have = set()
         mode = "init"                   # every file is stale, not just recent ones
-
-    # `init` rescans all of history for gaps; `update` only looks at recent activity
-    # (plus anything left .partial). Both skip whatever is already on disk, so either is
-    # safe to re-run.
     from_date = EARLIEST if mode == "init" else overlap_start(state, RAW_OVERLAP)
     if mode == "init" and have:
-        log(f"raw: verifying {len(have)} cached files …")
-        broken = raw_incomplete_ids()
-        if broken:
-            log(f"raw: {len(broken)} cached files hold transient failures — re-fetching",
-                icon="!")
-            have -= broken
+        have = raw_reverify(have)
     log(f"raw {mode.upper()}: {from_date} → {today}  ({len(have)} already cached)", icon="▶")
+    return mode, have, from_date
 
-    log("raw: refreshing account snapshot (zones, FTP, devices, gear)")
-    raw_account(g)
 
+def raw_reverify(have):
+    """On `init`, cached files that hold transient failures are fetched again."""
+    log(f"raw: verifying {len(have)} cached files …")
+    broken = raw_incomplete_ids()
+    if broken:
+        log(f"raw: {len(broken)} cached files hold transient failures — re-fetching", icon="!")
+    return have - broken
+
+
+def raw_todo(g, state, mode, from_date, today, have):
+    """The activities to capture: everything listed (plus, on update, earlier incomplete
+    captures) that isn't cached yet. `init` also records your first activity's date."""
     acts = raw_list_all(g, from_date, today)
     if mode == "init" and acts:            # oldest first, so this is your first activity
         state["start_date"] = acts[0]["startTimeLocal"][:10]
     if mode == "update":
-        listed = {a["activityId"] for a in acts}
-        retry = [a for a in raw_partial_list_objects() if a.get("activityId") not in listed]
-        if retry:
-            log(f"raw: retrying {len(retry)} incomplete captures from earlier runs")
-        acts += retry
+        acts += raw_retries(acts)
     todo = [a for a in acts if a["activityId"] not in have]
     log(f"raw: {len(acts)} activities in range, {len(todo)} to fetch "
         f"(~{len(todo) * len(RAW_ENDPOINTS) * (RAW_PAUSE + 0.2) / 3600:.1f} h)")
+    return todo
 
+
+def raw_retries(listed_acts):
+    """Incomplete captures from earlier runs that the listing didn't bring back."""
+    listed = {a["activityId"] for a in listed_acts}
+    retry = [a for a in raw_partial_list_objects() if a.get("activityId") not in listed]
+    if retry:
+        log(f"raw: retrying {len(retry)} incomplete captures from earlier runs")
+    return retry
+
+
+def raw_fetch_all(g, todo, have, state):
+    """Capture each activity, adding finished ones to `have`; returns how many had errors.
+    The manifest is checkpointed every RAW_SAVE_EVERY cached activities."""
     n_err = n_partial = 0
     prog = Progress("raw", len(todo))
     for a in todo:
-        aid = a["activityId"]
         rec = raw_capture(g, a)
-        partial = raw_retryable(rec)
-        raw_write(raw_path(aid, partial), rec)
-        if partial:
+        if raw_store(a["activityId"], rec, have):
             n_partial += 1
-        else:
-            stale = raw_path(aid, True)         # an earlier attempt may have left one
-            if os.path.exists(stale):
-                os.remove(stale)
-            have.add(aid)
         if rec["errors"]:
             n_err += 1
         prog.step(f"{rec['date']} {rec['type_key']}"
@@ -1346,16 +1369,20 @@ def raw_run(g, mode):
     if n_partial:
         log(f"raw: {n_partial} activities hit network failures and were left incomplete — "
             f"re-run `raw update` to retry them", icon="!")
+    return n_err
 
-    nbytes = raw_disk_bytes()
-    state.update({"last_updated": today, "schema": RAW_SCHEMA,
-                  "num_activities": len(have),
-                  "num_with_errors": n_err,
-                  "bytes_on_disk": nbytes,
-                  "generated_at": datetime.now().isoformat(timespec="seconds")})
-    save_state(RAW_STATE, state)
-    log(f"raw: +{len(todo)} new → {len(have)} activities cached, "
-        f"{nbytes / 1e6:.0f} MB in {os.path.basename(RAW_DIR)}/", icon="✓")
+
+def raw_store(aid, rec, have):
+    """Write one capture; returns True when it is incomplete and parked as .partial. A
+    complete capture replaces any .partial an earlier attempt left."""
+    partial = raw_retryable(rec)
+    raw_write(raw_path(aid, partial), rec)
+    if not partial:
+        stale = raw_path(aid, True)
+        if os.path.exists(stale):
+            os.remove(stale)
+        have.add(aid)
+    return partial
 
 
 # ===========================================================================

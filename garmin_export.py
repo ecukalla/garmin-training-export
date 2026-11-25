@@ -938,26 +938,12 @@ def body_pull_weight(g):
     prog = Progress("weigh-ins", len(years))
     for lo, hi in years:
         try:
-            wi = g.get_weigh_ins(lo, hi) or {}
+            answer = g.get_weigh_ins(lo, hi) or {}
         except Exception:
             failed.append((lo, hi))
-            wi = {}
+            answer = {}
         time.sleep(0.2)
-        for day in wi.get("dailyWeightSummaries", []) or []:
-            for m in day.get("allWeightMetrics", []) or []:
-                rows[m.get("samplePk")] = {
-                    "date": (m.get("calendarDate") or "")[:10],
-                    "weight_kg": round(m["weight"] / 1000, 2) if m.get("weight") else "",
-                    "bmi": _num(m, "bmi"),
-                    "body_fat_pct": m.get("bodyFat", ""),
-                    "body_water_pct": m.get("bodyWater", ""),
-                    "muscle_mass_kg": round(m["muscleMass"] / 1000, 2) if m.get("muscleMass") else "",
-                    "bone_mass_kg": round(m["boneMass"] / 1000, 2) if m.get("boneMass") else "",
-                    "visceral_fat": m.get("visceralFat", ""),
-                    "metabolic_age": m.get("metabolicAge", ""),
-                    "physique_rating": m.get("physiqueRating", ""),
-                    "source": m.get("sourceType", ""),
-                }
+        rows.update((m.get("samplePk"), weigh_in_row(m)) for m in _weigh_ins(answer))
         prog.step(f"{lo[:4]}: {len(rows)} so far")
     prog.done(f"{len(rows)} weigh-ins")
     kept = [r for r in read_csv_list(WEIGHT_CSV)
@@ -970,33 +956,61 @@ def body_pull_weight(g):
     return len(ordered)
 
 
+def _weigh_ins(answer):
+    """Every weigh-in in one get_weigh_ins answer, in the order Garmin sent them."""
+    return [m for day in answer.get("dailyWeightSummaries", []) or []
+            for m in day.get("allWeightMetrics", []) or []]
+
+
+def _kg(grams):
+    return round(grams / 1000, 2) if grams else ""
+
+
+def weigh_in_row(m):
+    """One weigh-in's CSV row. Garmin reports masses in grams."""
+    return {"date": (m.get("calendarDate") or "")[:10],
+            "weight_kg": _kg(m.get("weight")), "bmi": _num(m, "bmi"),
+            "body_fat_pct": m.get("bodyFat", ""), "body_water_pct": m.get("bodyWater", ""),
+            "muscle_mass_kg": _kg(m.get("muscleMass")), "bone_mass_kg": _kg(m.get("boneMass")),
+            "visceral_fat": m.get("visceralFat", ""), "metabolic_age": m.get("metabolicAge", ""),
+            "physique_rating": m.get("physiqueRating", ""), "source": m.get("sourceType", "")}
+
+
 def body_pull_prs(g):
     try:
         prs = g.get_personal_record() or []
     except Exception as e:
         log(f"body: personal records failed to fetch ({e}) — kept the last snapshot", icon="!")
         return len(read_csv_list(PR_CSV))
-    out = []
-    for p in prs:
-        tid = p.get("typeId")
-        label, kind = PR_LABELS.get(tid, (f"type_{tid}", "raw"))
-        val = p.get("value")
-        if kind == "time":
-            pretty, units = fmt_time(val), "h:mm:ss"
-        elif kind == "distance":
-            pretty, units = (round(val / 1000, 2) if isinstance(val, (int, float)) else ""), "km"
-        elif kind == "count":
-            pretty, units = (int(val) if isinstance(val, (int, float)) else ""), "count"
-        else:
-            pretty, units = "", ""
-        rec_date = (p.get("prStartTimeLocalFormatted")
-                    or p.get("activityStartDateTimeLocalFormatted") or "")
-        out.append({"type_id": tid, "label": label, "activity_type": p.get("activityType", ""),
-                    "value_raw": val, "value_pretty": pretty, "units": units,
-                    "record_date": rec_date[:10] if rec_date else ""})
-    out.sort(key=lambda r: (r["type_id"] if isinstance(r["type_id"], int) else 999))
+    out = sorted(map(pr_row, prs),
+                 key=lambda r: r["type_id"] if isinstance(r["type_id"], int) else 999)
     write_csv(PR_CSV, PR_COLS, out)
     return len(out)
+
+
+def _km(metres):
+    return round(metres / 1000, 2) if isinstance(metres, (int, float)) else ""
+
+
+def _count(n):
+    return int(n) if isinstance(n, (int, float)) else ""
+
+
+# How each kind of record in PR_LABELS is shown: (formatter, units). Unknown kinds: blank.
+PR_FORMATS = frozendict(time=(fmt_time, "h:mm:ss"), distance=(_km, "km"), count=(_count, "count"))
+PR_UNFORMATTED = (lambda value: "", "")
+
+
+def pr_row(p):
+    """One personal record's CSV row."""
+    tid, value = p.get("typeId"), p.get("value")
+    label, kind = PR_LABELS.get(tid, (f"type_{tid}", "raw"))
+    pretty, units = PR_FORMATS.get(kind, PR_UNFORMATTED)
+    rec_date = (p.get("prStartTimeLocalFormatted")
+                or p.get("activityStartDateTimeLocalFormatted") or "")
+    return {"type_id": tid, "label": label, "activity_type": p.get("activityType", ""),
+            "value_raw": value, "value_pretty": pretty(value), "units": units,
+            "record_date": rec_date[:10]}
 
 
 def body_pull_race(g):

@@ -42,6 +42,7 @@ import os
 import re
 import sys
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from functools import partial
 
@@ -153,8 +154,23 @@ def load_state(p, default):
     return dict(default)
 
 
+@contextmanager
+def atomic_write(p, opener=open, mode="w", **kw):
+    """Write through a temp file that replaces `p` only once complete, so an interrupted run
+    (Ctrl+C, crash) leaves the previous file whole — never a truncated one that the next
+    `update` would read back as the full history."""
+    tmp = p + ".tmp"
+    try:
+        with opener(tmp, mode, **kw) as f:
+            yield f
+        os.replace(tmp, p)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 def save_state(p, obj):
-    with open(p, "w") as f:
+    with atomic_write(p) as f:
         json.dump(obj, f, indent=2)
 
 
@@ -173,7 +189,7 @@ def read_csv_by_key(p, key):
 
 
 def write_csv(p, cols, rows):
-    with open(p, "w", newline="") as f:
+    with atomic_write(p, newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         for r in rows:
@@ -1024,10 +1040,8 @@ def raw_path(aid, partial=False):
 
 def raw_write(p, obj):
     """Write gzipped JSON atomically — a killed run never leaves a half-written file."""
-    tmp = p + ".tmp"
-    with gzip.open(tmp, "wt", encoding="utf-8") as f:
+    with atomic_write(p, gzip.open, "wt", encoding="utf-8") as f:
         json.dump(obj, f, default=str)
-    os.replace(tmp, p)
 
 
 def raw_read(p):

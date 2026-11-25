@@ -356,85 +356,102 @@ def summary_base(head, a, num_laps):
             "num_laps": num_laps}
 
 
+def resolve_mode(mode, state):
+    """`auto` is `init` on a domain's first run and `update` after it."""
+    if mode == "auto":
+        return "update" if state.get("last_updated") else "init"
+    return mode
+
+
 def activity_run(g, mode, d):
     """One activity domain: a summary row per activity plus its child rows ("parts": pool
     lengths or laps). Each activity is fetched once and remembered in the state file."""
-    name, noun, part = d["name"], d["noun"], d["part"]
-    n_key, parts_key = f"num_{noun}s", f"num_{part}_rows"
-    default = {"start_date": EARLIEST, "last_updated": None,
-               "processed_ids": [], n_key: 0, parts_key: 0}
-    state = load_state(d["state"], default)
-    today = date.today().isoformat()
-
+    state = load_state(d["state"], {"start_date": EARLIEST, "last_updated": None,
+                                    "processed_ids": [], f"num_{d['noun']}s": 0,
+                                    f"num_{d['part']}_rows": 0})
     if mode == "status":
-        pending = retry_note(len(state.get("failed") or {}))
-        first = f"first {state['start_date']}, " if state[n_key] else ""
-        print(f"  {name:<6}: {state[n_key]} {noun}s, {state.get(parts_key, 0)} {part} rows"
-              f"  ({first}last {state['last_updated'] or 'never'}){pending}")
+        activity_status(d, state)
         return
-    if mode == "auto":
-        mode = "update" if state.get("last_updated") else "init"
-
-    if mode == "init":
-        from_date = EARLIEST                # the first activity is learned from the data
-        existing_summary, existing_parts, processed = [], [], set()
-        log(f"{name} INIT: every {noun} on Garmin → {today}", icon="▶")
-    else:
-        from_date = min([overlap_start(state, d["overlap"])]
-                        + list(state.get("failed", {}).values()))   # reach back to retry
-        processed = {str(x) for x in state.get("processed_ids", [])}
-        # The state file is written last, so it is what commits a run: rows of an activity it
-        # never recorded come from an interrupted run, and that activity is fetched again.
-        existing_summary, existing_parts = (
-            [r for r in read_csv_list(d[k]) if r["activity_id"] in processed]
-            for k in ("summary_csv", "parts_csv"))
-        log(f"{name} UPDATE: {from_date} → {today}  ({len(processed)} already pulled)", icon="▶")
-
+    today = date.today().isoformat()
+    from_date, summaries, parts, processed = activity_plan(d, state, resolve_mode(mode, state),
+                                                           today)
     acts = d["list"](g, from_date, today)
     todo = [a for a in acts if str(a["activityId"]) not in processed]
-    log(f"{name}: {len(acts)} in range, {len(todo)} new to fetch")
+    log(f"{d['name']}: {len(acts)} in range, {len(todo)} new to fetch")
+    new_summaries, new_parts, fetched, failed = activity_fetch(g, d, todo, state["start_date"])
+    summaries, parts = summaries + new_summaries, parts + new_parts
+    activity_save(d, state, summaries, parts, processed | fetched, failed, today)
+    log(f"{d['name']}: +{len(new_summaries)} new → {len(summaries)} {d['noun']}s / {len(parts)} "
+        f"{d['part']}s written to {os.path.basename(d['summary_csv'])}, "
+        f"{os.path.basename(d['parts_csv'])}", icon="✓")
 
-    new_parts, new_summary, failed, err = [], [], {}, None
-    prog = Progress(name, len(todo))
+
+def activity_status(d, state):
+    n, rows = state[f"num_{d['noun']}s"], state.get(f"num_{d['part']}_rows", 0)
+    first = f"first {state['start_date']}, " if n else ""
+    print(f"  {d['name']:<6}: {n} {d['noun']}s, {rows} {d['part']} rows"
+          f"  ({first}last {state['last_updated'] or 'never'})"
+          f"{retry_note(len(state.get('failed') or {}))}")
+
+
+def activity_plan(d, state, mode, today):
+    """Where to list from, the rows to carry forward, and the IDs not to fetch again."""
+    if mode == "init":
+        log(f"{d['name']} INIT: every {d['noun']} on Garmin → {today}", icon="▶")
+        return EARLIEST, [], [], set()      # the first activity is learned from the data
+    from_date = min([overlap_start(state, d["overlap"])]
+                    + list(state.get("failed", {}).values()))   # reach back to retry
+    processed = {str(x) for x in state.get("processed_ids", [])}
+    # The state file is written last, so it is what commits a run: rows of an activity it
+    # never recorded come from an interrupted run, and that activity is fetched again.
+    summaries, parts = ([r for r in read_csv_list(d[k]) if r["activity_id"] in processed]
+                        for k in ("summary_csv", "parts_csv"))
+    log(f"{d['name']} UPDATE: {from_date} → {today}  ({len(processed)} already pulled)", icon="▶")
+    return from_date, summaries, parts, processed
+
+
+def activity_fetch(g, d, todo, fallback_day):
+    """Fetch and build each activity. One that fails lands in `failed` (id → day) for the
+    next run to retry, instead of being saved with no laps."""
+    summaries, parts, fetched, failed, err = [], [], set(), {}, None
+    prog = Progress(d["name"], len(todo))
     for a in todo:
         aid, day = str(a["activityId"]), (a.get("startTimeLocal") or "")[:10]
         try:
-            parts, summary = d["build"](a, fetch_splits(g, a["activityId"]))
+            rows, summary = d["build"](a, fetch_splits(g, a["activityId"]))
         except Exception as e:
-            failed[aid] = day or state["start_date"]
+            failed[aid] = day or fallback_day
             err = f"{type(e).__name__}: {e}"    # the text, not `e`: its traceback pins this frame
             prog.step(f"{day} failed")
         else:
-            new_parts.extend(parts)
-            new_summary.append(summary)
-            processed.add(aid)
-            prog.step(f"{day} ({len(parts)} {part}s)")
+            parts.extend(rows)
+            summaries.append(summary)
+            fetched.add(aid)
+            prog.step(f"{day} ({len(rows)} {d['part']}s)")
         time.sleep(0.3)
     if todo:
-        prog.done(f"{len(new_summary)} {noun}s, {len(new_parts)} {part}s")
+        prog.done(f"{len(summaries)} {d['noun']}s, {len(parts)} {d['part']}s")
     if failed:
-        log(f"{name}: {len(failed)} {noun}s failed to fetch and will be retried next run "
-            f"(last error: {err})", icon="!")
+        log(f"{d['name']}: {len(failed)} {d['noun']}s failed to fetch and will be retried next "
+            f"run (last error: {err})", icon="!")
+    return summaries, parts, fetched, failed
 
-    all_summary = existing_summary + new_summary
-    all_parts = existing_parts + new_parts
-    all_summary.sort(key=lambda r: (str(r.get("date", "")), str(r.get("activity_id", ""))))
-    all_parts.sort(key=lambda r: (str(r.get("date", "")), str(r.get("activity_id", "")),
-                                  int(r.get(d["part_order"]) or 0)))
-    write_csv(d["summary_csv"], d["summary_cols"], all_summary)
-    write_csv(d["parts_csv"], d["parts_cols"], all_parts)
 
+def activity_save(d, state, summaries, parts, processed, failed, today):
+    """Rewrite both CSVs sorted by date, then the state file — last, because it commits."""
+    summaries.sort(key=lambda r: (str(r.get("date", "")), str(r.get("activity_id", ""))))
+    parts.sort(key=lambda r: (str(r.get("date", "")), str(r.get("activity_id", "")),
+                              int(r.get(d["part_order"]) or 0)))
+    write_csv(d["summary_csv"], d["summary_cols"], summaries)
+    write_csv(d["parts_csv"], d["parts_cols"], parts)
     state.update({"last_updated": today,
                   # rows are sorted by date, so the first is your first activity
-                  "start_date": all_summary[0]["date"] if all_summary else state["start_date"],
+                  "start_date": summaries[0]["date"] if summaries else state["start_date"],
                   "processed_ids": sorted(processed, key=lambda x: int(x)),
-                  n_key: len(all_summary), parts_key: len(all_parts),
+                  f"num_{d['noun']}s": len(summaries), f"num_{d['part']}_rows": len(parts),
                   "failed": failed,
                   "generated_at": datetime.now().isoformat(timespec="seconds")})
     save_state(d["state"], state)
-    log(f"{name}: +{len(new_summary)} new → {len(all_summary)} {noun}s / {len(all_parts)} {part}s "
-        f"written to {os.path.basename(d['summary_csv'])}, {os.path.basename(d['parts_csv'])}",
-        icon="✓")
 
 
 # ===========================================================================

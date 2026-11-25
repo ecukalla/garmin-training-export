@@ -15,3 +15,8 @@ package = false    # scripts, not an installable package
 # Broad `except Exception` is deliberate: failures are classified by is_transient() or
 # recorded per activity/endpoint/domain instead of aborting the run.
 ignore = ["BLE001"]
+# Keep every function small enough to test fully: McCabe complexity at most 9.
+extend-select = ["C901"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 9

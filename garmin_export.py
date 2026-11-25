@@ -38,13 +38,15 @@ Auth: saved tokens; if login fails run `garmin-mcp-auth`.
 import csv
 import gzip
 import json
+import operator
 import os
 import re
 import sys
 import time
+from collections import Counter
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
-from functools import partial
+from functools import partial, reduce
 
 # Loaded on first use (PEP 810), so `status` — which runs with g=None — never imports them.
 lazy import requests
@@ -476,91 +478,105 @@ def swim_list(g, start, end):
     return list_activities(g, start, end, "swimming", lambda a: "swim" in _typekey(a))
 
 
+def _swimming(length):
+    return (length.get("distance") or 0) > 0
+
+
+def _seconds(length):
+    return length.get("duration") or 0.0
+
+
+def _seconds_in(lengths):
+    """Left-to-right total, as the exporter has always added durations — sum() compensates
+    rounding since Python 3.12, which can tip a .x5 total the other way."""
+    return reduce(operator.add, map(_seconds, lengths), 0.0)
+
+
+def _swim_sets(lengths):
+    """Group a swim's lengths into sets — (resting lengths before it, its active lengths).
+    Rest after the last set belongs to no set."""
+    sets, rest, active = [], [], []
+    for L in lengths:
+        if _swimming(L):
+            active.append(L)
+            continue
+        if active:
+            sets.append((rest, active))
+            rest, active = [], []
+        rest.append(L)
+    if active:
+        sets.append((rest, active))
+    return sets
+
+
+def _swim_length_rows(head, sets):
+    """One row per active length; the first length of each set carries the rest before it."""
+    pool_len = sets[0][1][0]["distance"] if sets else None
+    rows = []
+    for set_idx, (rest, active) in enumerate(sets, 1):
+        for i, L in enumerate(active, 1):
+            rows.append({**head, "pool_length_m": pool_len, "set_index": set_idx,
+                         "length_in_set": i, "global_length_n": len(rows) + 1,
+                         **_swim_length(L), **(_rest_before(rest) if i == 1 else _NO_REST)})
+    return rows
+
+
+_NO_REST = {"rest_before_set_s": 0, "rest_avg_hr": None, "rest_max_hr": None}
+
+
+def _rest_before(rest):
+    """What the first length of a set records about the rest that preceded it."""
+    seconds = _seconds_in(rest)
+    avg_hr, max_hr = _rest_hr([(L.get("averageHR"), L.get("maxHR"), _seconds(L)) for L in rest])
+    return {"rest_before_set_s": round(seconds, 1) if seconds else 0,
+            "rest_avg_hr": avg_hr, "rest_max_hr": max_hr}
+
+
+def _swim_length(L):
+    """The columns that come from the length itself."""
+    dist, dur = L["distance"], _seconds(L)
+    pace100 = round(dur / dist * 100, 1) if dur else None
+    return {"distance_m": dist, "duration_s": round(dur, 1), "pace_per_100m_s": pace100,
+            "stroke": L.get("swimStroke") or "", "swolf": L.get("averageSWOLF"),
+            "strokes": L.get("totalNumberOfStrokes"),
+            "avg_hr": L.get("averageHR"), "max_hr": L.get("maxHR"),
+            "likely_glitch": int(pace100 is not None and pace100 < SWIM_GLITCH_PACE)}
+
+
+def _round1(x):
+    return round(x, 1) if x else ""
+
+
+def _per_100m(seconds, metres):
+    return round(seconds / metres * 100, 1) if (seconds and metres) else ""
+
+
+def _swim_summary(a, head, rows, rest_s, num_sets):
+    swolfs = [r["swolf"] for r in rows if r["swolf"] is not None and not r["likely_glitch"]]
+    strokes = Counter(r["stroke"] for r in rows if r["stroke"])
+    dist, dur, moving = a.get("distance"), a.get("duration"), a.get("movingDuration")
+    return {**head, "pool_length_m": rows[0]["pool_length_m"] if rows else "",
+            "total_distance_m": _num(a, "distance"), "active_lengths": len(rows),
+            "total_duration_s": _round1(dur), "moving_duration_s": _round1(moving),
+            "rest_time_s": round(rest_s, 1),
+            "avg_pace_moving_per_100m_s": _per_100m(moving, dist),
+            "avg_pace_elapsed_per_100m_s": _per_100m(dur, dist),
+            "avg_hr": a.get("averageHR"), "max_hr": a.get("maxHR"),
+            "calories": a.get("calories"),
+            "avg_swolf_clean": round(sum(swolfs) / len(swolfs), 1) if swolfs else "",
+            "num_sets": num_sets,
+            "stroke_mix": "; ".join(f"{k}:{v}" for k, v in strokes.most_common())}
+
+
 def swim_build(a, splits):
     """One row per pool length, grouped into sets by the rests between them, plus the
     swim's summary row."""
     head = _head(a)
-    ordered = [*(lap.get("lengthDTOs") or []) for lap in splits.get("lapDTOs") or []]
-
-    pool_len = None
-    set_idx = 0
-    prev_active = False
-    pending_rest = 0.0
-    pending_rest_hr = []            # (avgHR, maxHR, duration) per resting length
-    length_in_set = 0
-    gn = 0
-    tally = {}
-    swolfs = []
-    rest_total = 0.0
-    length_rows = []
-
-    for L in ordered:
-        dist = L.get("distance")
-        dur  = L.get("duration") or 0.0
-        active = dist is not None and dist > 0
-        if active:
-            if pool_len is None:
-                pool_len = dist
-            if not prev_active:
-                set_idx += 1
-                length_in_set = 0
-                rest_before = pending_rest
-                rest_hr = _rest_hr(pending_rest_hr)
-                pending_rest = 0.0
-                pending_rest_hr = []
-            else:
-                rest_before = 0.0
-                rest_hr = (None, None)
-            length_in_set += 1
-            gn += 1
-            stroke  = L.get("swimStroke") or ""
-            swolf   = L.get("averageSWOLF")
-            strokes = L.get("totalNumberOfStrokes")
-            pace100 = round(dur / dist * 100, 1) if dur and dist else None
-            glitch  = 1 if (pace100 is not None and pace100 < SWIM_GLITCH_PACE) else 0
-            if stroke:
-                tally[stroke] = tally.get(stroke, 0) + 1
-            if swolf is not None and not glitch:
-                swolfs.append(swolf)
-            length_rows.append({
-                **head, "pool_length_m": pool_len, "set_index": set_idx,
-                "length_in_set": length_in_set, "global_length_n": gn,
-                "distance_m": dist, "duration_s": round(dur, 1),
-                "pace_per_100m_s": pace100, "stroke": stroke,
-                "swolf": swolf, "strokes": strokes,
-                "avg_hr": L.get("averageHR"), "max_hr": L.get("maxHR"),
-                "rest_before_set_s": round(rest_before, 1) if rest_before else 0,
-                "rest_avg_hr": rest_hr[0], "rest_max_hr": rest_hr[1],
-                "likely_glitch": glitch,
-            })
-            prev_active = True
-        else:
-            pending_rest += dur
-            rest_total += dur
-            pending_rest_hr.append((L.get("averageHR"), L.get("maxHR"), dur))
-            prev_active = False
-
-    total_dist = a.get("distance")
-    total_dur  = a.get("duration")
-    moving_dur = a.get("movingDuration")
-    avg_swolf  = round(sum(swolfs) / len(swolfs), 1) if swolfs else ""
-    pace_mov   = round(moving_dur / total_dist * 100, 1) if (moving_dur and total_dist) else ""
-    pace_ela   = round(total_dur / total_dist * 100, 1) if (total_dur and total_dist) else ""
-    stroke_mix = "; ".join(f"{k}:{v}" for k, v in sorted(tally.items(), key=lambda x: -x[1]))
-
-    summary_row = {
-        **head, "pool_length_m": pool_len or "",
-        "total_distance_m": _num(a, "distance"), "active_lengths": gn,
-        "total_duration_s": round(total_dur, 1) if total_dur else "",
-        "moving_duration_s": round(moving_dur, 1) if moving_dur else "",
-        "rest_time_s": round(rest_total, 1),
-        "avg_pace_moving_per_100m_s": pace_mov,
-        "avg_pace_elapsed_per_100m_s": pace_ela,
-        "avg_hr": a.get("averageHR"), "max_hr": a.get("maxHR"),
-        "calories": a.get("calories"), "avg_swolf_clean": avg_swolf,
-        "num_sets": set_idx, "stroke_mix": stroke_mix,
-    }
-    return length_rows, summary_row
+    lengths = [*(lap.get("lengthDTOs") or []) for lap in splits.get("lapDTOs") or []]
+    sets = _swim_sets(lengths)
+    rows = _swim_length_rows(head, sets)
+    rest_s = _seconds_in(L for L in lengths if not _swimming(L))
+    return rows, _swim_summary(a, head, rows, rest_s, len(sets))
 
 
 SWIM = frozendict(name="swim", noun="swim", part="length", part_order="global_length_n",
